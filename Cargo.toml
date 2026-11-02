@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fluxion-core",
+    "crates/fluxion-python",
+    "crates/fluxion-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/aliwert/fluxion"
+
+[workspace.dependencies]
+thiserror = "2"

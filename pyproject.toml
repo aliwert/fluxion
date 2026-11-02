@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fluxion"
+version = "0.1.0"
+description = "An adaptive, high-performance task execution engine for Python, powered by Rust."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.maturin]
+manifest-path = "crates/fluxion-python/Cargo.toml"
+python-source = "python"
+module-name = "fluxion._core"
