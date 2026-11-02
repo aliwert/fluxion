@@ -1,8 +1,11 @@
 [package]
 name = "fluxion-core"
+description = "Core execution engine for Fluxion."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true

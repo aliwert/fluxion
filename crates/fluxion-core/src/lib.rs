@@ -1,14 +1,13 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Core execution engine for Fluxion.
+//!
+//! This crate contains the Rust-native engine lifecycle and configuration
+//! primitives. It is intentionally independent of PyO3 and Python-specific
+//! types so that the execution core remains independently testable.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod config;
+pub mod engine;
+pub mod error;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use config::{DEFAULT_QUEUE_CAPACITY, EngineConfig};
+pub use engine::{Engine, EngineState};
+pub use error::EngineError;

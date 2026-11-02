@@ -1,8 +1,11 @@
 [package]
 name = "fluxion-bench"
+description = "Benchmark harness for the Fluxion execution engine."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
-fluxion-core = { path = "../fluxion-core" }
+fluxion-core.workspace = true
