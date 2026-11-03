@@ -1,6 +1,10 @@
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc;
+
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::queue::QueueError;
+use crate::task::{TaskError, TaskHandle};
 use crate::worker::WorkerPool;
 
 /// Lifecycle state of an [`Engine`].
@@ -50,26 +54,41 @@ impl Engine {
         self.state
     }
 
-    /// Submits a native Rust task for execution.
+    /// Submits a native Rust task and returns a handle to its result.
     ///
-    /// Submission is fire-and-forget: this method returns once the task has
-    /// been accepted by the bounded queue. The task's result, if any, must be
-    /// communicated through the task's own synchronization primitives.
+    /// The task starts executing once a worker is available. Every submitted
+    /// task receives an independent handle, and handles may be waited on in any
+    /// order. Dropping a handle without waiting is allowed; the task still
+    /// runs, and its result is discarded without blocking the worker.
     ///
-    /// Returns [`EngineError::QueueFull`] when the queue has no capacity and
-    /// [`EngineError::AlreadyShutdown`] after the engine has been shut down.
-    pub fn submit<F>(&self, task: F) -> Result<(), EngineError>
+    /// Task panics are caught and reported through the handle as
+    /// [`TaskError::Panicked`]. Returns [`EngineError::QueueFull`] when the
+    /// queue has no capacity and [`EngineError::AlreadyShutdown`] after the
+    /// engine has been shut down.
+    pub fn submit<F, T>(&self, task: F) -> Result<TaskHandle<T>, EngineError>
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
     {
         if self.state == EngineState::Shutdown {
             return Err(EngineError::AlreadyShutdown);
         }
 
+        let (sender, receiver) = mpsc::sync_channel::<Result<T, TaskError>>(1);
+        let task = move || {
+            let result = match panic::catch_unwind(AssertUnwindSafe(task)) {
+                Ok(value) => Ok(value),
+                Err(_) => Err(TaskError::Panicked),
+            };
+            let _ = sender.send(result);
+        };
+
         self.workers.submit(task).map_err(|error| match error {
             QueueError::Full => EngineError::QueueFull,
             QueueError::Closed => EngineError::AlreadyShutdown,
-        })
+        })?;
+
+        Ok(TaskHandle::new(receiver))
     }
 
     /// Shuts the engine down gracefully.
@@ -164,20 +183,128 @@ mod tests {
     }
 
     #[test]
-    fn executes_submitted_task() {
+    fn executes_submitted_task_and_returns_result() {
         let mut engine = Engine::new(test_config(1, 4)).expect("configuration should be valid");
-        let (sender, receiver) = mpsc::channel();
 
-        engine
-            .submit(move || sender.send(42).expect("receiver should be available"))
-            .expect("task should be accepted");
+        let handle = engine.submit(|| 21 * 2).expect("task should be accepted");
 
-        assert_eq!(
-            receiver
-                .recv_timeout(TEST_TIMEOUT)
-                .expect("task should complete"),
-            42
-        );
+        assert_eq!(handle.wait(), Ok(42));
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn different_result_types_are_supported() {
+        let mut engine = Engine::new(test_config(2, 8)).expect("configuration should be valid");
+
+        let string_handle = engine
+            .submit(|| String::from("fluxion"))
+            .expect("string task should be accepted");
+        let vector_handle = engine
+            .submit(|| vec![1_u64, 2, 3])
+            .expect("vector task should be accepted");
+        let tuple_handle = engine
+            .submit(|| (7_i32, true))
+            .expect("tuple task should be accepted");
+
+        assert_eq!(string_handle.wait(), Ok(String::from("fluxion")));
+        assert_eq!(vector_handle.wait(), Ok(vec![1_u64, 2, 3]));
+        assert_eq!(tuple_handle.wait(), Ok((7_i32, true)));
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn multiple_independent_task_handles_retrieve_results_out_of_order() {
+        let mut engine = Engine::new(test_config(2, 4)).expect("configuration should be valid");
+        let mut handles = Vec::new();
+
+        for value in [10, 20, 30] {
+            handles.push(
+                engine
+                    .submit(move || value)
+                    .expect("task should be accepted"),
+            );
+        }
+
+        assert_eq!(handles.remove(2).wait(), Ok(30));
+        assert_eq!(handles.remove(0).wait(), Ok(10));
+        assert_eq!(handles.remove(0).wait(), Ok(20));
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn dropped_handles_do_not_block_workers() {
+        const DROPPED_TASKS: usize = 32;
+
+        let mut engine = Engine::new(test_config(1, 64)).expect("configuration should be valid");
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..DROPPED_TASKS {
+            let completed = Arc::clone(&completed);
+            let handle = engine
+                .submit(move || {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    completed.load(Ordering::SeqCst)
+                })
+                .expect("task should be accepted");
+            drop(handle);
+        }
+
+        let marker = engine
+            .submit(|| 99)
+            .expect("marker task should be accepted");
+
+        assert_eq!(marker.wait(), Ok(99));
+        assert_eq!(completed.load(Ordering::SeqCst), DROPPED_TASKS);
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn supports_concurrent_result_retrieval() {
+        const TASK_COUNT: usize = 8;
+
+        let mut engine =
+            Engine::new(test_config(2, TASK_COUNT)).expect("configuration should be valid");
+        let handles: Vec<TaskHandle<usize>> = (0..TASK_COUNT)
+            .map(|value| {
+                engine
+                    .submit(move || value * 3)
+                    .expect("task should be accepted")
+            })
+            .collect();
+
+        let results = thread::scope(|scope| {
+            let waiters: Vec<_> = handles
+                .into_iter()
+                .enumerate()
+                .map(|(index, handle)| scope.spawn(move || (index, handle.wait())))
+                .collect();
+
+            waiters
+                .into_iter()
+                .map(|waiter| waiter.join().expect("waiter thread should not panic"))
+                .collect::<Vec<_>>()
+        });
+
+        for (index, result) in results {
+            assert_eq!(result, Ok(index * 3));
+        }
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn task_panic_is_propagated_without_terminating_worker_pool() {
+        let mut engine = Engine::new(test_config(1, 4)).expect("configuration should be valid");
+
+        let panic_handle = engine
+            .submit(|| -> usize { panic!("intentional task panic") })
+            .expect("panicking task should be accepted");
+        let success_handle = engine
+            .submit(|| 42)
+            .expect("subsequent task should be accepted");
+
+        assert_eq!(panic_handle.wait(), Err(TaskError::Panicked));
+        assert_eq!(success_handle.wait(), Ok(42));
+        assert_eq!(engine.state(), EngineState::Initialized);
         assert_eq!(engine.shutdown(), Ok(()));
     }
 
@@ -235,7 +362,6 @@ mod tests {
         let mut engine = Engine::new(test_config(1, 1)).expect("configuration should be valid");
         let (started_sender, started_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
-        let (completed_sender, completed_receiver) = mpsc::channel();
 
         engine
             .submit(move || {
@@ -245,41 +371,36 @@ mod tests {
                 release_receiver
                     .recv_timeout(TEST_TIMEOUT)
                     .expect("blocking task should be released");
+                1
             })
             .expect("first task should be accepted");
         started_receiver
             .recv_timeout(TEST_TIMEOUT)
             .expect("first task should start");
 
-        let second = engine.submit(move || {
-            completed_sender
-                .send(())
-                .expect("completed receiver should be available");
-        });
-        let third = engine.submit(|| {});
+        let second = engine.submit(|| 2);
+        let third = engine.submit(|| 3);
 
         release_sender
             .send(())
             .expect("blocking task should be released");
         let shutdown = engine.shutdown();
 
-        assert_eq!(second, Ok(()));
-        assert_eq!(third, Err(EngineError::QueueFull));
+        assert!(second.is_ok());
+        assert!(matches!(third, Err(EngineError::QueueFull)));
         assert_eq!(shutdown, Ok(()));
-        assert!(
-            completed_receiver.recv_timeout(TEST_TIMEOUT).is_ok(),
-            "queued task should run during shutdown"
-        );
+
+        let second = second.expect("second task should have been accepted");
+        assert_eq!(second.wait(), Ok(2));
     }
 
     #[test]
-    fn shutdown_waits_for_accepted_tasks() {
+    fn shutdown_waits_for_accepted_tasks_and_preserves_results() {
         let mut engine = Engine::new(test_config(1, 4)).expect("configuration should be valid");
         let (started_sender, started_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
-        let (completed_sender, completed_receiver) = mpsc::channel();
 
-        engine
+        let blocking_handle = engine
             .submit(move || {
                 started_sender
                     .send(())
@@ -287,19 +408,14 @@ mod tests {
                 release_receiver
                     .recv_timeout(TEST_TIMEOUT)
                     .expect("blocking task should be released");
+                1
             })
             .expect("first task should be accepted");
         started_receiver
             .recv_timeout(TEST_TIMEOUT)
             .expect("first task should start");
 
-        engine
-            .submit(move || {
-                completed_sender
-                    .send(())
-                    .expect("completed receiver should be available");
-            })
-            .expect("second task should be accepted");
+        let queued_handle = engine.submit(|| 2).expect("second task should be accepted");
 
         let shutdown = thread::spawn(move || engine.shutdown());
         release_sender
@@ -309,10 +425,8 @@ mod tests {
         let shutdown_result = shutdown.join().expect("shutdown thread should not panic");
 
         assert_eq!(shutdown_result, Ok(()));
-        assert!(
-            completed_receiver.recv_timeout(TEST_TIMEOUT).is_ok(),
-            "accepted task should complete before shutdown returns"
-        );
+        assert_eq!(blocking_handle.wait(), Ok(1));
+        assert_eq!(queued_handle.wait(), Ok(2));
     }
 
     #[test]
@@ -320,29 +434,10 @@ mod tests {
         let mut engine = Engine::new(test_config(1, 4)).expect("configuration should be valid");
         engine.shutdown().expect("shutdown should succeed");
 
-        assert_eq!(engine.submit(|| {}), Err(EngineError::AlreadyShutdown));
-    }
-
-    #[test]
-    fn task_panic_does_not_terminate_worker_pool() {
-        let mut engine = Engine::new(test_config(1, 4)).expect("configuration should be valid");
-        let (sender, receiver) = mpsc::channel();
-
-        engine
-            .submit(|| panic!("intentional task panic"))
-            .expect("panicking task should be accepted");
-        engine
-            .submit(move || {
-                sender.send(()).expect("receiver should be available");
-            })
-            .expect("subsequent task should be accepted");
-
-        assert!(
-            receiver.recv_timeout(TEST_TIMEOUT).is_ok(),
-            "worker should continue running tasks after a task panic"
-        );
-        assert_eq!(engine.state(), EngineState::Initialized);
-        assert_eq!(engine.shutdown(), Ok(()));
+        assert!(matches!(
+            engine.submit(|| {}),
+            Err(EngineError::AlreadyShutdown)
+        ));
     }
 
     #[test]
