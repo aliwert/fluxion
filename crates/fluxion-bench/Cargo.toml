@@ -7,5 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[dependencies]
+[dev-dependencies]
+criterion.workspace = true
 fluxion-core.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false
