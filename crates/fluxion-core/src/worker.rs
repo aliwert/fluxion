@@ -1,3 +1,5 @@
+use std::any::Any;
+use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -14,15 +16,20 @@ pub(crate) struct WorkerPool {
 }
 
 impl WorkerPool {
-    pub(crate) fn new(config: &EngineConfig) -> Result<Self, EngineError> {
+    pub(crate) fn new(config: &EngineConfig, prefetch_batch: usize) -> Result<Self, EngineError> {
+        debug_assert!(prefetch_batch > 0);
+
         let queue = Arc::new(TaskQueue::new(config.queue_capacity));
         let mut workers = Vec::with_capacity(config.worker_count);
 
         for worker_index in 0..config.worker_count {
             let worker_queue = Arc::clone(&queue);
+            let worker_count = config.worker_count;
             let spawn_result = thread::Builder::new()
                 .name(format!("fluxion-worker-{worker_index}"))
-                .spawn(move || worker_loop(worker_queue));
+                .spawn(move || {
+                    worker_loop(worker_index, worker_count, worker_queue, prefetch_batch);
+                });
 
             match spawn_result {
                 Ok(handle) => workers.push(handle),
@@ -87,8 +94,169 @@ impl fmt::Debug for WorkerPool {
     }
 }
 
-fn worker_loop(queue: Arc<TaskQueue>) {
-    while let Some(task) = queue.pop() {
+fn worker_loop(
+    worker_id: usize,
+    worker_count: usize,
+    queue: Arc<TaskQueue>,
+    prefetch_batch: usize,
+) {
+    let mut prefetched = VecDeque::with_capacity(prefetch_batch);
+
+    // An internal failure must not strand tasks already claimed by this worker.
+    // Finish the local buffer before resuming the panic so the pool reports the
+    // worker failure while preserving task completion guarantees.
+    let failure = panic::catch_unwind(AssertUnwindSafe(|| {
+        loop {
+            if prefetched.is_empty()
+                && !queue.claim_into(&mut prefetched, prefetch_batch, worker_count)
+            {
+                break;
+            }
+
+            while let Some(task) = prefetched.pop_front() {
+                let _ = panic::catch_unwind(AssertUnwindSafe(task));
+            }
+        }
+    }));
+
+    if let Err(payload) = failure {
+        drain_prefetched(&mut prefetched);
+        panic::resume_unwind(worker_failure(worker_id, payload));
+    }
+}
+
+fn drain_prefetched(prefetched: &mut VecDeque<crate::queue::Task>) {
+    while let Some(task) = prefetched.pop_front() {
         let _ = panic::catch_unwind(AssertUnwindSafe(task));
+    }
+}
+
+fn worker_failure(worker_id: usize, payload: Box<dyn Any + Send>) -> Box<dyn Any + Send> {
+    // Preserve the panic message while recording which worker failed.
+    let message = match payload.downcast_ref::<&str>() {
+        Some(message) => format!("worker {worker_id} failed: {message}"),
+        None => match payload.downcast_ref::<String>() {
+            Some(message) => format!("worker {worker_id} failed: {message}"),
+            None => format!("worker {worker_id} failed"),
+        },
+    };
+
+    Box::new(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::queue::Task;
+
+    fn record_task(records: Arc<Mutex<Vec<usize>>>, value: usize) -> Task {
+        Box::new(move || {
+            records
+                .lock()
+                .expect("record lock should not be poisoned")
+                .push(value);
+        })
+    }
+
+    fn run_worker(queue: Arc<TaskQueue>, prefetch_batch: usize) {
+        worker_loop(0, 1, queue, prefetch_batch);
+    }
+
+    #[test]
+    fn worker_executes_local_prefetch_before_claiming_more() {
+        let queue = Arc::new(TaskQueue::new(32));
+        let records = Arc::new(Mutex::new(Vec::new()));
+
+        for value in 0..20 {
+            queue
+                .push(record_task(Arc::clone(&records), value))
+                .expect("task should be accepted");
+        }
+        queue.close();
+
+        let worker = {
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || run_worker(queue, 8))
+        };
+        worker.join().expect("worker should not panic");
+
+        assert_eq!(
+            *records.lock().expect("record lock should not be poisoned"),
+            (0..20).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn task_panic_does_not_discard_prefetched_tasks() {
+        let queue = Arc::new(TaskQueue::new(8));
+        let records = Arc::new(Mutex::new(Vec::new()));
+
+        for value in 0..8 {
+            if value == 2 {
+                queue
+                    .push(Box::new(|| panic!("intentional task panic")))
+                    .expect("panicking task should be accepted");
+            } else {
+                queue
+                    .push(record_task(Arc::clone(&records), value))
+                    .expect("task should be accepted");
+            }
+        }
+        queue.close();
+
+        let worker = {
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || run_worker(queue, 8))
+        };
+        worker
+            .join()
+            .expect("task panic should not terminate worker");
+
+        assert_eq!(
+            *records.lock().expect("record lock should not be poisoned"),
+            [0, 1, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn closing_an_idle_queue_stops_worker() {
+        let queue = Arc::new(TaskQueue::new(4));
+        let worker = {
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || run_worker(queue, 4))
+        };
+
+        queue.close();
+        worker.join().expect("worker should not panic");
+        assert!(queue.is_closed());
+    }
+
+    #[test]
+    fn every_task_executes_exactly_once_across_prefetch_batches() {
+        const TASKS: usize = 100;
+
+        let queue = Arc::new(TaskQueue::new(TASKS));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..TASKS {
+            let completed = Arc::clone(&completed);
+            queue
+                .push(Box::new(move || {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }))
+                .expect("task should be accepted");
+        }
+        queue.close();
+
+        let worker = {
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || run_worker(queue, 8))
+        };
+        worker.join().expect("worker should not panic");
+
+        assert_eq!(completed.load(Ordering::SeqCst), TASKS);
     }
 }

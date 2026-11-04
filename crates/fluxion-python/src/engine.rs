@@ -31,7 +31,8 @@ impl PyEngine {
 
 #[pymethods]
 impl PyEngine {
-    /// Creates an engine with the supplied worker count and queue capacity.
+    /// Creates an engine with the supplied worker count and injection-queue
+    /// capacity.
     ///
     /// Omitted values use the Rust core defaults. Invalid values raise
     /// `ValueError`.
@@ -58,7 +59,9 @@ impl PyEngine {
         self.config.worker_count
     }
 
-    /// Maximum number of pending tasks configured for this engine.
+    /// Capacity of the shared injection queue.
+    ///
+    /// Workers may additionally hold a small fixed batch of prefetched tasks.
     #[getter]
     fn queue_capacity(&self) -> usize {
         self.config.queue_capacity

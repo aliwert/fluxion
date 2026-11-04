@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-fluxion-core.workspace = true
+fluxion-core = { workspace = true, features = ["bench-internals"] }
 
 [[bench]]
 name = "engine"

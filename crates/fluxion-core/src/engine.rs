@@ -1,7 +1,7 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc;
 
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, PREFETCH_BATCH};
 use crate::error::EngineError;
 use crate::queue::QueueError;
 use crate::task::{TaskError, TaskHandle};
@@ -34,8 +34,30 @@ impl Engine {
     /// The configuration is validated before any engine state is created. On
     /// success, the configured number of worker threads is started.
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
+        Self::build(config, PREFETCH_BATCH)
+    }
+
+    /// Creates an engine with an explicit internal prefetch batch.
+    ///
+    /// This constructor is hidden from the public documentation and exists only
+    /// for benchmark and internal test builds. Applications should use
+    /// [`Engine::new`].
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn new_with_prefetch(
+        config: EngineConfig,
+        prefetch_batch: usize,
+    ) -> Result<Self, EngineError> {
+        assert!(
+            prefetch_batch > 0,
+            "prefetch batch must be greater than zero"
+        );
+        Self::build(config, prefetch_batch)
+    }
+
+    fn build(config: EngineConfig, prefetch_batch: usize) -> Result<Self, EngineError> {
         config.validate()?;
-        let workers = WorkerPool::new(&config)?;
+        let workers = WorkerPool::new(&config, prefetch_batch)?;
 
         Ok(Self {
             config,
@@ -427,6 +449,83 @@ mod tests {
         assert_eq!(shutdown_result, Ok(()));
         assert_eq!(blocking_handle.wait(), Ok(1));
         assert_eq!(queued_handle.wait(), Ok(2));
+    }
+
+    #[test]
+    fn shutdown_drains_queued_and_prefetched_tasks() {
+        const TASKS: usize = 32;
+
+        let mut engine = Engine::new(test_config(1, 64)).expect("configuration should be valid");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        let blocking_handle = engine
+            .submit(move || {
+                started_sender
+                    .send(())
+                    .expect("started receiver should be available");
+                release_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("blocking task should be released");
+                0
+            })
+            .expect("blocking task should be accepted");
+        started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("blocking task should start");
+
+        let handles: Vec<_> = (1..=TASKS)
+            .map(|value| {
+                engine
+                    .submit(move || value)
+                    .expect("queued task should be accepted")
+            })
+            .collect();
+
+        let shutdown = thread::spawn(move || engine.shutdown());
+        release_sender
+            .send(())
+            .expect("blocking task should be released");
+
+        assert_eq!(
+            shutdown.join().expect("shutdown thread should not panic"),
+            Ok(())
+        );
+        assert_eq!(blocking_handle.wait(), Ok(0));
+
+        for (index, handle) in handles.into_iter().enumerate() {
+            assert_eq!(handle.wait(), Ok(index + 1));
+        }
+    }
+
+    #[test]
+    fn repeated_batched_submission_completes_all_tasks() {
+        const ROUNDS: usize = 25;
+        const TASKS_PER_ROUND: usize = 256;
+
+        let mut engine =
+            Engine::new(test_config(8, TASKS_PER_ROUND)).expect("configuration should be valid");
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..ROUNDS {
+            let handles: Vec<_> = (0..TASKS_PER_ROUND)
+                .map(|_| {
+                    let completed = Arc::clone(&completed);
+                    engine
+                        .submit(move || {
+                            completed.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .expect("task should be accepted")
+                })
+                .collect();
+
+            for handle in handles {
+                handle.wait().expect("task should complete successfully");
+            }
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), ROUNDS * TASKS_PER_ROUND);
+        assert_eq!(engine.shutdown(), Ok(()));
     }
 
     #[test]

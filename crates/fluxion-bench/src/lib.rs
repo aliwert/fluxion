@@ -12,8 +12,17 @@
 //!
 //! ```text
 //! cargo bench -p fluxion-bench -- task_throughput
+//! cargo bench -p fluxion-bench -- prefetch_batch_sweep
+//! cargo bench -p fluxion-bench -- multi_submitter
+//! cargo bench -p fluxion-bench -- mixed_workload
 //! cargo bench -p fluxion-bench -- queue_capacity
 //! cargo bench -p fluxion-bench -- sequential_baseline
+//! ```
+//!
+//! Compare against a previously saved baseline by name:
+//!
+//! ```text
+//! cargo bench -p fluxion-bench -- --baseline global-fifo
 //! ```
 //!
 //! `cargo bench` builds with the `bench` profile, which inherits from
@@ -30,9 +39,17 @@
 //! - `task_throughput` submits a fixed batch, then waits for every result.
 //!   Criterion reports throughput as tasks per second. Compare worker-count
 //!   variants to observe scaling.
-//! - `queue_capacity_effect` runs the same fixed batch with several queue
-//!   capacities. Capacity changes allocation-independent queue behavior; at
-//!   capacities at or above the batch size, differences may be within noise.
+//! - `prefetch_batch_sweep` varies the internal per-worker claim batch for
+//!   `noop` and `small_cpu` workloads across worker counts. It uses a hidden
+//!   benchmark-only constructor; applications cannot configure this value.
+//! - `multi_submitter` varies the number of concurrent submitter threads
+//!   sharing one engine, which exercises injection-queue contention.
+//! - `mixed_workload` compares uniform and skewed task-duration mixes. The
+//!   skewed mix is mostly `noop` with occasional `small_cpu` and `medium_cpu`
+//!   tasks, making owner-local prefetch effects visible.
+//! - `queue_capacity_effect` runs the same fixed batch with several injection
+//!   queue capacities. Capacity changes allocation-independent queue behavior;
+//!   at capacities at or above the batch size, differences may be within noise.
 //!
 //! Task throughput and task latency are not interchangeable: throughput is
 //! batch-oriented work per second, while latency is the elapsed time for one

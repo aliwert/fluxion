@@ -5,6 +5,9 @@ use crate::error::EngineError;
 /// Default capacity of the engine's task queue.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
+/// Number of tasks a worker may claim into its private prefetch buffer.
+pub(crate) const PREFETCH_BATCH: usize = 8;
+
 /// Runtime configuration for the execution engine.
 ///
 /// Configuration is validated when an [`crate::Engine`] is created. Values can
@@ -14,7 +17,11 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 pub struct EngineConfig {
     /// Number of worker threads the engine may use.
     pub worker_count: usize,
-    /// Maximum number of pending tasks the engine may hold.
+    /// Maximum number of tasks waiting in the shared injection queue.
+    ///
+    /// Workers may additionally hold a fixed batch of prefetched tasks in
+    /// private buffers. The maximum number of pending tasks is therefore
+    /// `queue_capacity + worker_count * 8`.
     pub queue_capacity: usize,
 }
 
