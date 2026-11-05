@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+experimental-work-stealing = ["fluxion-core/experimental-work-stealing"]
+
 [dev-dependencies]
 criterion.workspace = true
 fluxion-core = { workspace = true, features = ["bench-internals"] }
@@ -18,3 +21,8 @@ harness = false
 [[bench]]
 name = "scheduling_eval"
 harness = false
+
+[[bench]]
+name = "work_stealing_eval"
+harness = false
+required-features = ["experimental-work-stealing"]

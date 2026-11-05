@@ -20,7 +20,13 @@
 //! cargo bench -p fluxion-bench -- multi_producer
 //! cargo bench -p fluxion-bench -- load_imbalance
 //! cargo bench -p fluxion-bench -- shutdown_drain
+//! cargo bench -p fluxion-bench --features experimental-work-stealing --bench work_stealing_eval
 //! ```
+//!
+//! The work-stealing benchmark is experimental and requires the
+//! `experimental-work-stealing` feature explicitly. A normal benchmark build
+//! does not enable the feature or activate the core's optional
+//! `crossbeam-deque` dependency.
 //!
 //! Compare against a previously saved baseline by name:
 //!
@@ -70,6 +76,56 @@
 //!   comparison.
 //! - `shutdown_drain` fills the queue with medium tasks while every worker is
 //!   blocked, then measures release plus graceful shutdown drain time.
+//! - `work_stealing_eval` runs the same multi-producer, gated load, tail, and
+//!   shutdown workloads for the current scheduler and the experimental
+//!   work-stealing scheduler. It prints `[phase6d]` summaries, including steal
+//!   attempts and successes. The same source, compiled in a no-feature control
+//!   harness against the pre-batching core (`d3440fc`), provides the original
+//!   global-FIFO result. The experiment was rejected for production; see the
+//!   results below.
+//!
+//! # Phase 6D work-stealing experiment
+//!
+//! Work stealing was investigated to reduce tail latency and improve
+//! utilization under skewed load. The experiment was implemented behind the
+//! `experimental-work-stealing` feature and benchmarked against the production
+//! batch-claiming scheduler using 30 Criterion samples, a 1-second warm-up,
+//! and a 2-second measurement window on an Apple M3 Max (16 cores, 64 GiB),
+//! macOS 26.3.1 arm64, Rust 1.95.0, and Criterion 0.8.2.
+//!
+//! Pre-registered acceptance criteria:
+//!
+//! - At least 5% lower gated makespan for 4-worker long-then-short.
+//! - At least a 2 percentage point utilization increase.
+//! - At least 50% lower tail idle time.
+//! - A material reduction in medium-count CV.
+//! - No more than 3% regression for 8-worker long-then-short, 4-worker
+//!   small90-medium10, or multi-producer no-op and small-CPU workloads.
+//! - Shutdown time within noise of the production scheduler.
+//! - All experimental correctness and shutdown tests passing.
+//!
+//! Results, as changes versus the production batch-claiming scheduler:
+//!
+//! | Metric | Change | Interpretation |
+//! | --- | ---: | --- |
+//! | 4-worker long-then-short gated makespan | -8.6% | Improvement |
+//! | Tail makespan | -10.4% | Improvement |
+//! | Worker utilization | +2.2 percentage points | Improvement |
+//! | Tail idle time | -65% | Improvement |
+//! | Medium-count CV | -27% | Improvement |
+//! | Multi-producer no-op | +26.0% to +103.3% | Regression |
+//! | Multi-producer small CPU | +9.0% to +16.6% | Regression |
+//!
+//! Negative makespan changes are improvements because less time is required.
+//! Positive execution-time changes are regressions. Multi-producer ranges cover
+//! 1, 2, 4, and 8 producers.
+//!
+//! The targeted load-imbalance criteria passed, but the multi-producer
+//! no-regression criterion failed. Work stealing was therefore rejected for
+//! production adoption. The benchmarks and correctness tests are retained for
+//! reproducibility and future experiments, but the production scheduler
+//! remains the bounded global injection queue with batch claiming and
+//! per-worker FIFO prefetch buffers.
 //!
 //! Task throughput and task latency are not interchangeable: throughput is
 //! batch-oriented work per second, while latency is the elapsed time for one

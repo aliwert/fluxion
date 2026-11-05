@@ -10,10 +10,15 @@ pub mod engine;
 pub mod error;
 pub mod task;
 
+#[cfg(feature = "experimental-work-stealing")]
+mod experimental;
 mod queue;
 mod worker;
 
 pub use config::{DEFAULT_QUEUE_CAPACITY, EngineConfig};
 pub use engine::{Engine, EngineState};
 pub use error::EngineError;
+#[cfg(feature = "experimental-work-stealing")]
+#[doc(hidden)]
+pub use experimental::{StealStatsSnapshot, WorkStealingEngine};
 pub use task::{TaskError, TaskHandle};

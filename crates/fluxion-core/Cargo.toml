@@ -9,6 +9,8 @@ repository.workspace = true
 
 [features]
 bench-internals = []
+experimental-work-stealing = ["bench-internals", "dep:crossbeam-deque"]
 
 [dependencies]
+crossbeam-deque = { workspace = true, optional = true }
 thiserror.workspace = true

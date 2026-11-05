@@ -15,6 +15,7 @@ repository = "https://github.com/aliwert/fluxion"
 
 [workspace.dependencies]
 criterion = "0.8"
+crossbeam-deque = "0.8"
 fluxion-core = { path = "crates/fluxion-core" }
 pyo3 = { version = "0.27", features = ["extension-module"] }
 thiserror = "2"

@@ -13,6 +13,15 @@ pub(crate) enum QueueError {
     Closed,
 }
 
+/// Result of a nonblocking batch claim.
+#[cfg(feature = "experimental-work-stealing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimOutcome {
+    Claimed,
+    Empty,
+    Closed,
+}
+
 struct QueueState {
     tasks: VecDeque<Task>,
     closed: bool,
@@ -127,6 +136,47 @@ impl TaskQueue {
         }
     }
 
+    /// Attempts to claim a batch without blocking.
+    ///
+    /// The callback runs while the queue lock is held so that a worker's
+    /// quiescence count becomes visible before another worker can observe an
+    /// empty closed queue.
+    #[cfg(feature = "experimental-work-stealing")]
+    pub(crate) fn try_claim_into<F>(
+        &self,
+        destination: &mut VecDeque<Task>,
+        max_batch: usize,
+        worker_count: usize,
+        record_claim: F,
+    ) -> ClaimOutcome
+    where
+        F: FnOnce(usize),
+    {
+        debug_assert!(destination.is_empty());
+        debug_assert!(max_batch > 0);
+
+        let mut state = self.lock_state();
+
+        if let Some(claim_count) = claim_batch(&mut state, destination, max_batch, worker_count) {
+            record_claim(claim_count);
+
+            let notifications = notifications_needed(&mut state);
+            drop(state);
+
+            for _ in 0..notifications {
+                self.available.notify_one();
+            }
+
+            return ClaimOutcome::Claimed;
+        }
+
+        if state.closed {
+            ClaimOutcome::Closed
+        } else {
+            ClaimOutcome::Empty
+        }
+    }
+
     pub(crate) fn close(&self) {
         let mut state = self.lock_state();
         state.closed = true;
@@ -149,10 +199,44 @@ impl TaskQueue {
         self.lock_state().tasks.len()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "experimental-work-stealing"))]
     pub(crate) fn is_closed(&self) -> bool {
         self.lock_state().closed
     }
+
+    #[cfg(feature = "experimental-work-stealing")]
+    pub(crate) fn is_closed_and_empty(&self) -> bool {
+        let state = self.lock_state();
+        state.closed && state.tasks.is_empty()
+    }
+}
+
+#[cfg(feature = "experimental-work-stealing")]
+fn claim_batch(
+    state: &mut QueueState,
+    destination: &mut VecDeque<Task>,
+    max_batch: usize,
+    worker_count: usize,
+) -> Option<usize> {
+    if state.tasks.is_empty() {
+        return None;
+    }
+
+    let backlog = state.tasks.len();
+    // Avoid letting one worker drain a small burst while its peers sleep;
+    // larger backlogs still allow full prefetch batches.
+    let fair_share = backlog.div_ceil(worker_count.max(1));
+    let claim_count = max_batch.min(fair_share);
+    let mut claimed = 0;
+
+    for _ in 0..claim_count {
+        if let Some(task) = state.tasks.pop_front() {
+            destination.push_back(task);
+            claimed += 1;
+        }
+    }
+
+    Some(claimed)
 }
 
 fn notifications_needed(state: &mut QueueState) -> usize {
@@ -290,6 +374,57 @@ mod tests {
 
         assert_eq!(claim_tasks(&queue, 8, 8).len(), 1);
         assert_eq!(queue.len(), 2);
+    }
+
+    #[cfg(feature = "experimental-work-stealing")]
+    #[test]
+    fn try_claim_reports_empty_claimed_and_closed() {
+        let queue = TaskQueue::new(8);
+        let recorded = AtomicUsize::new(0);
+        let mut local = VecDeque::with_capacity(8);
+
+        assert_eq!(
+            queue.try_claim_into(&mut local, 8, 4, |count| {
+                recorded.fetch_add(count, Ordering::SeqCst);
+            }),
+            ClaimOutcome::Empty
+        );
+        assert_eq!(recorded.load(Ordering::SeqCst), 0);
+
+        for _ in 0..4 {
+            queue.push(noop_task()).expect("task should be accepted");
+        }
+
+        assert_eq!(
+            queue.try_claim_into(&mut local, 8, 4, |count| {
+                recorded.fetch_add(count, Ordering::SeqCst);
+            }),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(local.len(), 1);
+        assert_eq!(recorded.load(Ordering::SeqCst), 1);
+
+        queue.close();
+
+        for _ in 0..3 {
+            local.clear();
+            assert_eq!(
+                queue.try_claim_into(&mut local, 8, 4, |count| {
+                    recorded.fetch_add(count, Ordering::SeqCst);
+                }),
+                ClaimOutcome::Claimed
+            );
+            assert_eq!(local.len(), 1);
+        }
+
+        local.clear();
+        assert_eq!(
+            queue.try_claim_into(&mut local, 8, 4, |count| {
+                recorded.fetch_add(count, Ordering::SeqCst);
+            }),
+            ClaimOutcome::Closed
+        );
+        assert_eq!(recorded.load(Ordering::SeqCst), 4);
     }
 
     #[test]
