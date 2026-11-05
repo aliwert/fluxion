@@ -14,3 +14,7 @@ fluxion-core = { workspace = true, features = ["bench-internals"] }
 [[bench]]
 name = "engine"
 harness = false
+
+[[bench]]
+name = "scheduling_eval"
+harness = false

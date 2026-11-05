@@ -17,6 +17,9 @@
 //! cargo bench -p fluxion-bench -- mixed_workload
 //! cargo bench -p fluxion-bench -- queue_capacity
 //! cargo bench -p fluxion-bench -- sequential_baseline
+//! cargo bench -p fluxion-bench -- multi_producer
+//! cargo bench -p fluxion-bench -- load_imbalance
+//! cargo bench -p fluxion-bench -- shutdown_drain
 //! ```
 //!
 //! Compare against a previously saved baseline by name:
@@ -50,6 +53,23 @@
 //! - `queue_capacity_effect` runs the same fixed batch with several injection
 //!   queue capacities. Capacity changes allocation-independent queue behavior;
 //!   at capacities at or above the batch size, differences may be within noise.
+//! - `multi_producer/round` keeps producer threads alive across iterations and
+//!   uses barriers, so thread creation is excluded. It measures submission and
+//!   completion of the same aggregate batch for 1, 2, 4, and 8 producers.
+//! - `multi_producer/submission` measures only the submission phase of the
+//!   same producer rounds. Task completion is drained before the next measured
+//!   round.
+//! - `load_imbalance` runs 90% small / 10% medium, short-then-long,
+//!   long-then-short, and deterministically shuffled mixes. Every worker is
+//!   gated before the mix is submitted, so timed iterations measure queue drain
+//!   rather than producer submission cost.
+//! - `load_imbalance_tail` repeats those gated mixes with benchmark-side
+//!   per-task timestamps. It prints median makespan, latency percentiles,
+//!   utilization, per-worker mean task counts, medium-task counts, and tail
+//!   idle time. The instrumentation is not intended for direct throughput
+//!   comparison.
+//! - `shutdown_drain` fills the queue with medium tasks while every worker is
+//!   blocked, then measures release plus graceful shutdown drain time.
 //!
 //! Task throughput and task latency are not interchangeable: throughput is
 //! batch-oriented work per second, while latency is the elapsed time for one
