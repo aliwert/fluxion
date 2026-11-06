@@ -1,10 +1,7 @@
-use std::panic::{self, AssertUnwindSafe};
-use std::sync::mpsc;
-
 use crate::config::{EngineConfig, PREFETCH_BATCH};
 use crate::error::EngineError;
 use crate::queue::QueueError;
-use crate::task::{TaskError, TaskHandle};
+use crate::task::{TaskHandle, prepare_task};
 use crate::worker::WorkerPool;
 
 /// Lifecycle state of an [`Engine`].
@@ -83,8 +80,10 @@ impl Engine {
     /// order. Dropping a handle without waiting is allowed; the task still
     /// runs, and its result is discarded without blocking the worker.
     ///
-    /// Task panics are caught and reported through the handle as
-    /// [`TaskError::Panicked`]. Returns [`EngineError::QueueFull`] when the
+    /// A queued task can be cancelled through [`TaskHandle::cancel`]. Running
+    /// and completed tasks are not interrupted, and a timed-out wait does not
+    /// cancel the task. Task panics are caught and reported through the handle
+    /// as [`crate::task::TaskError::Panicked`]. Returns [`EngineError::QueueFull`] when the
     /// queue has no capacity and [`EngineError::AlreadyShutdown`] after the
     /// engine has been shut down.
     pub fn submit<F, T>(&self, task: F) -> Result<TaskHandle<T>, EngineError>
@@ -96,21 +95,14 @@ impl Engine {
             return Err(EngineError::AlreadyShutdown);
         }
 
-        let (sender, receiver) = mpsc::sync_channel::<Result<T, TaskError>>(1);
-        let task = move || {
-            let result = match panic::catch_unwind(AssertUnwindSafe(task)) {
-                Ok(value) => Ok(value),
-                Err(_) => Err(TaskError::Panicked),
-            };
-            let _ = sender.send(result);
-        };
+        let (handle, task) = prepare_task(task);
 
         self.workers.submit(task).map_err(|error| match error {
             QueueError::Full => EngineError::QueueFull,
             QueueError::Closed => EngineError::AlreadyShutdown,
         })?;
 
-        Ok(TaskHandle::new(receiver))
+        Ok(handle)
     }
 
     /// Shuts the engine down gracefully.
@@ -138,6 +130,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::task::{TaskError, TaskStatus, TaskWaitOutcome};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -575,5 +568,316 @@ mod tests {
         assert_eq!(failures.load(Ordering::SeqCst), 0);
         assert_eq!(engine.shutdown(), Ok(()));
         assert_eq!(completed.load(Ordering::SeqCst), TOTAL_TASKS);
+    }
+
+    #[test]
+    fn cancelling_queued_task_prevents_execution() {
+        let mut engine = Engine::new(test_config(1, 8)).expect("configuration should be valid");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        let blocker = engine
+            .submit(move || {
+                started_sender
+                    .send(())
+                    .expect("started receiver should be available");
+                release_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("blocking task should be released");
+            })
+            .expect("blocking task should be accepted");
+        started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("blocking task should start");
+
+        let executed = Arc::new(AtomicUsize::new(0));
+        let task_executed = Arc::clone(&executed);
+        let handle = engine
+            .submit(move || {
+                task_executed.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("queued task should be accepted");
+
+        assert_eq!(handle.status(), TaskStatus::Queued);
+        assert!(handle.cancel());
+        assert!(handle.cancelled());
+        assert!(handle.done());
+        assert_eq!(handle.wait(), Err(TaskError::Cancelled));
+
+        release_sender
+            .send(())
+            .expect("blocking task should be released");
+        assert_eq!(blocker.wait(), Ok(()));
+
+        let marker = engine
+            .submit(|| 17)
+            .expect("marker task should be accepted");
+        assert_eq!(marker.wait(), Ok(17));
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn wait_timeout_does_not_cancel_queued_task() {
+        let mut engine = Engine::new(test_config(1, 8)).expect("configuration should be valid");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        let blocker = engine
+            .submit(move || {
+                started_sender
+                    .send(())
+                    .expect("started receiver should be available");
+                release_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("blocking task should be released");
+            })
+            .expect("blocking task should be accepted");
+        started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("blocking task should start");
+
+        let handle = engine
+            .submit(|| 42)
+            .expect("queued task should be accepted");
+
+        let handle = match handle.wait_timeout(Duration::from_millis(10)) {
+            TaskWaitOutcome::TimedOut(handle) => handle,
+            TaskWaitOutcome::Completed(result) => {
+                panic!("queued task should not complete: {result:?}")
+            }
+        };
+
+        assert_eq!(handle.status(), TaskStatus::Queued);
+        release_sender
+            .send(())
+            .expect("blocking task should be released");
+
+        assert_eq!(blocker.wait(), Ok(()));
+        assert_eq!(handle.wait(), Ok(42));
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn wait_timeout_does_not_interrupt_running_task() {
+        let mut engine = Engine::new(test_config(1, 8)).expect("configuration should be valid");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        let handle = engine
+            .submit(move || {
+                started_sender
+                    .send(())
+                    .expect("started receiver should be available");
+                release_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("running task should be released");
+                33
+            })
+            .expect("task should be accepted");
+        started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("task should start");
+
+        let handle = match handle.wait_timeout(Duration::from_millis(10)) {
+            TaskWaitOutcome::TimedOut(handle) => handle,
+            TaskWaitOutcome::Completed(result) => {
+                panic!("running task should not complete: {result:?}")
+            }
+        };
+
+        assert_eq!(handle.status(), TaskStatus::Running);
+        assert!(!handle.cancel());
+
+        release_sender
+            .send(())
+            .expect("running task should be released");
+        assert_eq!(handle.wait(), Ok(33));
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn task_can_be_cancelled_after_cancellation_timeout() {
+        let mut engine = Engine::new(test_config(1, 8)).expect("configuration should be valid");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        let blocker = engine
+            .submit(move || {
+                started_sender
+                    .send(())
+                    .expect("started receiver should be available");
+                release_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("blocking task should be released");
+            })
+            .expect("blocking task should be accepted");
+        started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("blocking task should start");
+
+        let handle = engine
+            .submit(|| 11)
+            .expect("queued task should be accepted");
+        let handle = match handle.wait_timeout(Duration::ZERO) {
+            TaskWaitOutcome::TimedOut(handle) => handle,
+            TaskWaitOutcome::Completed(result) => {
+                panic!("queued task should not complete: {result:?}")
+            }
+        };
+
+        assert!(handle.cancel());
+        assert_eq!(handle.wait(), Err(TaskError::Cancelled));
+
+        release_sender
+            .send(())
+            .expect("blocking task should be released");
+        assert_eq!(blocker.wait(), Ok(()));
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn concurrent_cancellation_executes_uncancelled_tasks_exactly_once() {
+        const SUBMITTERS: usize = 4;
+        const TASKS_PER_SUBMITTER: usize = 128;
+        const CANCELLERS: usize = 8;
+        const TOTAL_TASKS: usize = SUBMITTERS * TASKS_PER_SUBMITTER;
+
+        let mut engine =
+            Engine::new(test_config(4, TOTAL_TASKS)).expect("configuration should be valid");
+        let executions: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..TOTAL_TASKS).map(|_| AtomicUsize::new(0)).collect());
+
+        let handles = thread::scope(|scope| {
+            let submitters: Vec<_> = (0..SUBMITTERS)
+                .map(|submitter| {
+                    let engine = &engine;
+                    let executions = Arc::clone(&executions);
+
+                    scope.spawn(move || {
+                        (0..TASKS_PER_SUBMITTER)
+                            .map(|offset| {
+                                let index = submitter * TASKS_PER_SUBMITTER + offset;
+                                let executions = Arc::clone(&executions);
+                                engine
+                                    .submit(move || {
+                                        executions[index].fetch_add(1, Ordering::SeqCst);
+                                    })
+                                    .expect("task should be accepted")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+
+            submitters
+                .into_iter()
+                .flat_map(|submitter| submitter.join().expect("submitter should not panic"))
+                .collect::<Vec<_>>()
+        });
+
+        let mut buckets: Vec<Vec<(usize, TaskHandle<()>)>> =
+            (0..CANCELLERS).map(|_| Vec::new()).collect();
+        for (index, handle) in handles.into_iter().enumerate() {
+            buckets[index % CANCELLERS].push((index, handle));
+        }
+
+        let cancelled = thread::scope(|scope| {
+            let cancellers: Vec<_> = buckets
+                .into_iter()
+                .map(|bucket| {
+                    scope.spawn(move || {
+                        bucket
+                            .into_iter()
+                            .map(|(index, handle)| {
+                                let was_cancelled = handle.cancel();
+                                let result = handle.wait();
+                                (index, was_cancelled, result)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+
+            cancellers
+                .into_iter()
+                .flat_map(|canceller| canceller.join().expect("canceller should not panic"))
+                .collect::<Vec<_>>()
+        });
+
+        for (index, was_cancelled, result) in cancelled {
+            if was_cancelled {
+                assert_eq!(result, Err(TaskError::Cancelled));
+                assert_eq!(executions[index].load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(result, Ok(()));
+                assert_eq!(executions[index].load(Ordering::SeqCst), 1);
+            }
+        }
+
+        assert_eq!(engine.shutdown(), Ok(()));
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn cancelling_prefetched_task_prevents_execution() {
+        let mut engine =
+            Engine::new_with_prefetch(test_config(1, 8), 2).expect("configuration should be valid");
+        let (blocker_started_sender, blocker_started_receiver) = mpsc::channel();
+        let (blocker_release_sender, blocker_release_receiver) = mpsc::channel();
+
+        let blocker = engine
+            .submit(move || {
+                blocker_started_sender
+                    .send(())
+                    .expect("started receiver should be available");
+                blocker_release_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("blocking task should be released");
+            })
+            .expect("blocking task should be accepted");
+        blocker_started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("blocking task should start");
+
+        let (running_started_sender, running_started_receiver) = mpsc::channel();
+        let (running_release_sender, running_release_receiver) = mpsc::channel();
+        let running = engine
+            .submit(move || {
+                running_started_sender
+                    .send(())
+                    .expect("started receiver should be available");
+                running_release_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("running task should be released");
+            })
+            .expect("running task should be accepted");
+
+        let executed = Arc::new(AtomicUsize::new(0));
+        let prefetched_executed = Arc::clone(&executed);
+        let prefetched = engine
+            .submit(move || {
+                prefetched_executed.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("prefetched task should be accepted");
+
+        blocker_release_sender
+            .send(())
+            .expect("blocking task should be released");
+        assert_eq!(blocker.wait(), Ok(()));
+        running_started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("running task should start");
+
+        assert_eq!(prefetched.status(), TaskStatus::Queued);
+        assert!(prefetched.cancel());
+        assert_eq!(prefetched.wait(), Err(TaskError::Cancelled));
+
+        running_release_sender
+            .send(())
+            .expect("running task should be released");
+        assert_eq!(running.wait(), Ok(()));
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.shutdown(), Ok(()));
     }
 }

@@ -9,7 +9,6 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
@@ -19,7 +18,7 @@ use crate::config::{EngineConfig, PREFETCH_BATCH};
 use crate::engine::EngineState;
 use crate::error::EngineError;
 use crate::queue::{ClaimOutcome, QueueError, Task, TaskQueue};
-use crate::task::{TaskError, TaskHandle};
+use crate::task::{TaskHandle, prepare_task};
 
 const MAX_STEAL_RETRIES: usize = 8;
 
@@ -136,14 +135,7 @@ impl WorkStealingEngine {
             return Err(EngineError::AlreadyShutdown);
         }
 
-        let (sender, receiver) = mpsc::sync_channel::<Result<T, TaskError>>(1);
-        let task = move || {
-            let result = match panic::catch_unwind(AssertUnwindSafe(task)) {
-                Ok(value) => Ok(value),
-                Err(_) => Err(TaskError::Panicked),
-            };
-            let _ = sender.send(result);
-        };
+        let (handle, task) = prepare_task(task);
 
         self.workers
             .submit(Box::new(task))
@@ -152,7 +144,7 @@ impl WorkStealingEngine {
                 QueueError::Closed => EngineError::AlreadyShutdown,
             })?;
 
-        Ok(TaskHandle::new(receiver))
+        Ok(handle)
     }
 
     /// Shuts the experimental engine down gracefully.
@@ -561,10 +553,11 @@ impl WorkSignal {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Barrier, Mutex};
+    use std::sync::{Barrier, Mutex, mpsc};
     use std::time::Duration;
 
     use super::*;
+    use crate::task::TaskError;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 

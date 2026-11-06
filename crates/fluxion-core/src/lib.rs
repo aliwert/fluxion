@@ -21,4 +21,4 @@ pub use error::EngineError;
 #[cfg(feature = "experimental-work-stealing")]
 #[doc(hidden)]
 pub use experimental::{StealStatsSnapshot, WorkStealingEngine};
-pub use task::{TaskError, TaskHandle};
+pub use task::{TaskError, TaskHandle, TaskStatus, TaskWaitOutcome};
