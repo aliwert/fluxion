@@ -1,7 +1,9 @@
+import concurrent.futures
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 from importlib.metadata import version
 
 import pytest
@@ -273,3 +275,275 @@ def test_implicit_engine_destruction_releases_gil():
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_task_lifecycle_and_cancel_before_start():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+    executed = []
+
+    def blocker():
+        started.set()
+        assert release.wait(5)
+
+    try:
+        blocking_handle = engine.submit(blocker)
+        assert started.wait(5)
+
+        handle = engine.submit(lambda: executed.append(True))
+
+        assert handle.status == "queued"
+        assert not handle.done()
+        assert not handle.cancelled()
+        assert handle.cancel() is True
+        assert handle.cancel() is False
+        assert handle.status == "cancelled"
+        assert handle.done()
+        assert handle.cancelled()
+
+        with pytest.raises(concurrent.futures.CancelledError):
+            handle.wait()
+
+        assert handle.status == "cancelled"
+        assert executed == []
+
+        release.set()
+        assert blocking_handle.wait() is None
+    finally:
+        release.set()
+        engine.shutdown()
+
+
+def test_cancel_prefetched_task_prevents_execution():
+    engine = Engine(worker_count=1, queue_capacity=32)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    running_started = threading.Event()
+    release_running = threading.Event()
+    target_executed = []
+
+    def blocker():
+        blocker_started.set()
+        assert release_blocker.wait(5)
+
+    def running():
+        running_started.set()
+        assert release_running.wait(5)
+
+    try:
+        blocking_handle = engine.submit(blocker)
+        assert blocker_started.wait(5)
+
+        running_handle = engine.submit(running)
+        target = engine.submit(lambda: target_executed.append(True))
+        fillers = [engine.submit(lambda: None) for _ in range(6)]
+
+        release_blocker.set()
+        assert running_started.wait(5)
+
+        assert target.status == "queued"
+        assert target.cancel() is True
+
+        release_running.set()
+        assert running_handle.wait() is None
+
+        with pytest.raises(concurrent.futures.CancelledError):
+            target.wait()
+
+        assert target.status == "cancelled"
+        assert target_executed == []
+        assert blocking_handle.wait() is None
+        assert all(handle.wait() is None for handle in fillers)
+    finally:
+        release_blocker.set()
+        release_running.set()
+        engine.shutdown()
+
+
+def test_wait_timeout_preserves_handle_and_does_not_cancel_task():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_task():
+        started.set()
+        assert release.wait(5)
+        return "finished"
+
+    try:
+        handle = engine.submit(blocking_task)
+        assert started.wait(5)
+
+        with pytest.raises(concurrent.futures.TimeoutError):
+            handle.wait(timeout=0.05)
+
+        assert handle.status == "running"
+        assert not handle.done()
+        assert handle.cancel() is False
+
+        release.set()
+        assert handle.wait(timeout=5) == "finished"
+        assert handle.status == "completed"
+        assert handle.done()
+        assert not handle.cancelled()
+    finally:
+        release.set()
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0])
+def test_zero_and_negative_timeouts_are_immediate(timeout):
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_task():
+        started.set()
+        assert release.wait(5)
+        return "finished"
+
+    try:
+        handle = engine.submit(blocking_task)
+        assert started.wait(5)
+
+        with pytest.raises(concurrent.futures.TimeoutError):
+            handle.wait(timeout=timeout)
+
+        release.set()
+        assert handle.wait(timeout=5) == "finished"
+    finally:
+        release.set()
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_timeouts_raise_value_error(timeout):
+    engine = Engine(worker_count=1, queue_capacity=4)
+    try:
+        handle = engine.submit(lambda: 42)
+
+        with pytest.raises(ValueError, match="finite"):
+            handle.wait(timeout=timeout)
+
+        assert handle.wait(timeout=5) == 42
+    finally:
+        engine.shutdown()
+
+
+def test_out_of_range_timeout_raises_value_error():
+    engine = Engine(worker_count=1, queue_capacity=4)
+    try:
+        handle = engine.submit(lambda: 42)
+
+        with pytest.raises(ValueError, match="out of range"):
+            handle.wait(timeout=1e300)
+
+        assert handle.wait(timeout=5) == 42
+    finally:
+        engine.shutdown()
+
+
+def test_status_reports_callback_failure_before_wait():
+    class CallbackError(Exception):
+        pass
+
+    engine = Engine(worker_count=1, queue_capacity=4)
+    callback_finished = threading.Event()
+    error = CallbackError("callback failed")
+
+    def fail():
+        callback_finished.set()
+        raise error
+
+    try:
+        handle = engine.submit(fail)
+        assert callback_finished.wait(5)
+
+        deadline = time.monotonic() + 5
+        while not handle.done() and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+        assert handle.done()
+        assert handle.status == "failed"
+        assert not handle.cancelled()
+
+        with pytest.raises(CallbackError, match="callback failed") as caught:
+            handle.wait()
+
+        assert caught.value is error
+        assert handle.status == "failed"
+    finally:
+        engine.shutdown()
+
+
+def test_completed_status_is_visible_before_wait():
+    engine = Engine(worker_count=1, queue_capacity=4)
+    try:
+        handle = engine.submit(lambda: "done")
+
+        deadline = time.monotonic() + 5
+        while not handle.done() and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+        assert handle.done()
+        assert handle.status == "completed"
+        assert not handle.cancelled()
+        assert handle.wait() == "done"
+        assert handle.status == "completed"
+    finally:
+        engine.shutdown()
+
+
+def test_engine_context_manager_shuts_down_on_exit():
+    with Engine(worker_count=1, queue_capacity=4) as engine:
+        assert engine.submit(lambda: 42).wait() == 42
+
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.submit(lambda: 1)
+
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.shutdown()
+
+
+def test_engine_context_manager_propagates_block_exception_and_shuts_down():
+    class BlockError(Exception):
+        pass
+
+    with pytest.raises(BlockError, match="block failed"):
+        with Engine(worker_count=1, queue_capacity=4) as engine:
+            handle = engine.submit(lambda: "accepted")
+            raise BlockError("block failed")
+
+    assert handle.wait() == "accepted"
+
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.submit(lambda: 1)
+
+
+def test_engine_context_manager_ignores_duplicate_shutdown_on_clean_exit():
+    engine = Engine(worker_count=1, queue_capacity=4)
+
+    with engine as entered:
+        assert entered is engine
+        assert entered.submit(lambda: 42).wait() == 42
+        engine.shutdown()
+
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.submit(lambda: 1)
+
+
+def test_engine_context_manager_shutdown_error_takes_precedence():
+    class BlockError(Exception):
+        pass
+
+    engine = Engine(worker_count=1, queue_capacity=4)
+
+    with pytest.raises(RuntimeError, match="engine has already been shut down") as caught:
+        with engine:
+            engine.shutdown()
+            raise BlockError("block failed")
+
+    assert isinstance(caught.value.__context__, BlockError)
+    assert caught.value.__cause__ is None
+    assert not caught.value.__suppress_context__

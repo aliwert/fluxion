@@ -1,12 +1,12 @@
 use std::sync::{Mutex, MutexGuard};
 
-use fluxion_core::{Engine, EngineConfig};
+use fluxion_core::{Engine, EngineConfig, EngineError};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
 
 use crate::error::engine_error;
-use crate::task::{PyTaskHandle, PythonTaskResult};
+use crate::task::{CallbackFailure, PyTaskHandle, PythonTaskResult};
 
 /// Runs Python callables on Fluxion's Rust-managed worker threads.
 ///
@@ -26,6 +26,15 @@ impl PyEngine {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    fn shutdown_inner(&self, py: Python<'_>) -> Result<(), EngineError> {
+        let mut engine = {
+            let mut inner = self.lock_inner();
+            inner.take().ok_or(EngineError::AlreadyShutdown)?
+        };
+
+        py.detach(move || engine.shutdown())
     }
 }
 
@@ -84,18 +93,61 @@ impl PyEngine {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("engine has already been shut down"))?;
 
+        let callback_failure = CallbackFailure::new();
+        let task_failure = callback_failure.clone();
         let handle = engine
             .submit(move || -> PythonTaskResult {
-                match Python::try_attach(|py| callable.call0(py)) {
+                let result = match Python::try_attach(move |py| {
+                    let result = callable.call0(py);
+                    drop(callable);
+                    result
+                }) {
                     Some(result) => result,
                     None => Err(PyRuntimeError::new_err(
                         "Python interpreter is not available to execute callback",
                     )),
+                };
+
+                if result.is_err() {
+                    task_failure.mark();
                 }
+
+                result
             })
             .map_err(engine_error)?;
 
-        Ok(PyTaskHandle::new(handle))
+        Ok(PyTaskHandle::new(handle, callback_failure))
+    }
+
+    /// Enters the engine context manager and returns the engine.
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Exits the engine context and shuts the engine down.
+    ///
+    /// Accepted tasks are drained by the normal shutdown path. If shutdown
+    /// fails, the shutdown error is raised. When the with-block is already
+    /// propagating an exception, that exception is chained as the shutdown
+    /// error's ``__context__``, so shutdown errors take precedence.
+    ///
+    /// If ``shutdown`` was already called manually and the block exits
+    /// normally, the duplicate-shutdown condition is treated as success. If
+    /// the block is already raising, shutdown errors still take precedence and
+    /// a duplicate shutdown is not ignored. Other shutdown failures are never
+    /// suppressed.
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exception_type: Option<&Bound<'_, PyAny>>,
+        _exception_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        match self.shutdown_inner(py) {
+            Ok(()) => Ok(false),
+            Err(EngineError::AlreadyShutdown) if exception_type.is_none() => Ok(false),
+            Err(error) => Err(engine_error(error)),
+        }
     }
 
     /// Shuts the engine down gracefully and waits for accepted tasks.
@@ -105,14 +157,7 @@ impl PyEngine {
     /// Calling `shutdown` again raises `RuntimeError`. Do not call `shutdown`
     /// from inside a callback submitted to this engine.
     fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
-        let mut engine = {
-            let mut inner = self.lock_inner();
-            inner
-                .take()
-                .ok_or_else(|| PyRuntimeError::new_err("engine has already been shut down"))?
-        };
-
-        py.detach(move || engine.shutdown()).map_err(engine_error)
+        self.shutdown_inner(py).map_err(engine_error)
     }
 }
 
