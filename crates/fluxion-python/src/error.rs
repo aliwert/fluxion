@@ -10,6 +10,7 @@ pub(crate) fn engine_error(error: EngineError) -> PyErr {
     match error {
         EngineError::InvalidConfiguration { .. } => PyValueError::new_err(message),
         EngineError::AlreadyShutdown
+        | EngineError::ShutdownFromWorker
         | EngineError::QueueFull
         | EngineError::WorkerSpawnFailed { .. }
         | EngineError::WorkerFailed { .. } => PyRuntimeError::new_err(message),

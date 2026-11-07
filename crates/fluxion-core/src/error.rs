@@ -16,6 +16,14 @@ pub enum EngineError {
     #[error("engine has already been shut down")]
     AlreadyShutdown,
 
+    /// Shutdown was requested from one of this engine's worker threads.
+    ///
+    /// The request is rejected before the queue is closed or the engine state
+    /// changes, so the engine remains usable. Call shutdown from a non-worker
+    /// thread instead.
+    #[error("engine cannot be shut down from one of its worker threads")]
+    ShutdownFromWorker,
+
     /// The task queue has reached its configured capacity.
     #[error("task queue is full")]
     QueueFull,

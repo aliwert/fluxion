@@ -277,6 +277,100 @@ def test_implicit_engine_destruction_releases_gil():
     assert result.returncode == 0, result.stderr
 
 
+def test_shutdown_from_worker_callback_is_rejected_and_engine_remains_usable():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    errors = []
+
+    def callback():
+        try:
+            engine.shutdown()
+        except RuntimeError as error:
+            errors.append(error)
+        return 42
+
+    try:
+        assert engine.submit(callback).wait() == 42
+        assert len(errors) == 1
+        assert "cannot be shut down from one of its worker threads" in str(errors[0])
+        assert engine.submit(lambda: 7).wait() == 7
+    finally:
+        engine.shutdown()
+
+    with pytest.raises(RuntimeError, match="already been shut down"):
+        engine.shutdown()
+
+
+def test_engine_destruction_from_worker_callback_drains_accepted_tasks():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    completed = []
+
+    def callback():
+        nonlocal engine
+        callback_started.set()
+        assert release_callback.wait(5)
+        del engine
+        return "destroyed"
+
+    destructor = engine.submit(callback)
+    queued = [
+        engine.submit(lambda value=value: completed.append(value) or value)
+        for value in range(4)
+    ]
+
+    assert callback_started.wait(5)
+    release_callback.set()
+
+    assert destructor.wait() == "destroyed"
+    assert [handle.wait() for handle in queued] == [0, 1, 2, 3]
+    assert completed == [0, 1, 2, 3]
+
+
+def test_concurrent_submit_and_shutdown_have_deterministic_admission():
+    engine = Engine(worker_count=2, queue_capacity=512)
+    barrier = threading.Barrier(5)
+    accepted = []
+    rejected = []
+    accepted_lock = threading.Lock()
+
+    def submit_batch():
+        barrier.wait()
+        local_handles = []
+
+        for _ in range(32):
+            try:
+                local_handles.append(engine.submit(lambda: 1))
+            except RuntimeError as error:
+                with accepted_lock:
+                    rejected.append(error)
+
+        with accepted_lock:
+            accepted.extend(local_handles)
+
+    def shutdown():
+        barrier.wait()
+        engine.shutdown()
+
+    threads = [
+        threading.Thread(target=submit_batch),
+        threading.Thread(target=submit_batch),
+        threading.Thread(target=submit_batch),
+        threading.Thread(target=submit_batch),
+        threading.Thread(target=shutdown),
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(accepted) + len(rejected) == 128
+    assert all("already been shut down" in str(error) for error in rejected)
+    assert [handle.wait() for handle in accepted] == [1] * len(accepted)
+
+
 def test_task_lifecycle_and_cancel_before_start():
     engine = Engine(worker_count=1, queue_capacity=8)
     started = threading.Event()

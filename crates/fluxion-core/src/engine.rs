@@ -73,6 +73,14 @@ impl Engine {
         self.state
     }
 
+    /// Returns whether the calling thread is one of this engine's workers.
+    ///
+    /// This can be used by integration layers to reject operations that would
+    /// require a worker to join itself before taking ownership of the engine.
+    pub fn is_worker_thread(&self) -> bool {
+        self.workers.is_worker_thread(std::thread::current().id())
+    }
+
     /// Submits a native Rust task and returns a handle to its result.
     ///
     /// The task starts executing once a worker is available. Every submitted
@@ -111,12 +119,21 @@ impl Engine {
     /// completed, and all worker threads are joined. Shutdown may only be
     /// performed once. Calling this method again returns
     /// [`EngineError::AlreadyShutdown`].
+    ///
+    /// Calling this method from one of this engine's worker threads returns
+    /// [`EngineError::ShutdownFromWorker`] before the queue is closed or the
+    /// lifecycle state changes. A rejected shutdown leaves the engine usable.
     pub fn shutdown(&mut self) -> Result<(), EngineError> {
         if self.state == EngineState::Shutdown {
             return Err(EngineError::AlreadyShutdown);
         }
 
         let result = self.workers.shutdown();
+
+        if matches!(&result, Err(EngineError::ShutdownFromWorker)) {
+            return result;
+        }
+
         self.state = EngineState::Shutdown;
         result
     }
@@ -125,7 +142,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
@@ -195,6 +212,255 @@ mod tests {
 
         assert_eq!(engine.shutdown(), Err(EngineError::AlreadyShutdown));
         assert_eq!(engine.state(), EngineState::Shutdown);
+    }
+
+    #[test]
+    fn shutdown_from_worker_is_rejected_and_engine_remains_usable() {
+        let engine = Arc::new(Mutex::new(
+            Engine::new(test_config(1, 4)).expect("configuration should be valid"),
+        ));
+        let worker_engine = Arc::clone(&engine);
+        let handle = engine
+            .lock()
+            .expect("engine lock should not be poisoned")
+            .submit(move || {
+                worker_engine
+                    .lock()
+                    .expect("engine lock should not be poisoned")
+                    .shutdown()
+            })
+            .expect("task should be accepted");
+
+        assert_eq!(handle.wait(), Ok(Err(EngineError::ShutdownFromWorker)));
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock should not be poisoned")
+                .state(),
+            EngineState::Initialized
+        );
+
+        let marker = engine
+            .lock()
+            .expect("engine lock should not be poisoned")
+            .submit(|| 42)
+            .expect("engine should remain usable");
+        assert_eq!(marker.wait(), Ok(42));
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock should not be poisoned")
+                .shutdown(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn multiple_workers_cannot_shut_down_their_own_engine() {
+        const WORKER_COUNT: usize = 4;
+
+        let engine = Arc::new(Mutex::new(
+            Engine::new(test_config(WORKER_COUNT, WORKER_COUNT))
+                .expect("configuration should be valid"),
+        ));
+        let barrier = Arc::new(Barrier::new(WORKER_COUNT));
+
+        let handles: Vec<_> = (0..WORKER_COUNT)
+            .map(|_| {
+                let worker_engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+
+                engine
+                    .lock()
+                    .expect("engine lock should not be poisoned")
+                    .submit(move || {
+                        barrier.wait();
+                        worker_engine
+                            .lock()
+                            .expect("engine lock should not be poisoned")
+                            .shutdown()
+                    })
+                    .expect("task should be accepted")
+            })
+            .collect();
+
+        for handle in handles {
+            assert_eq!(handle.wait(), Ok(Err(EngineError::ShutdownFromWorker)));
+        }
+
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock should not be poisoned")
+                .state(),
+            EngineState::Initialized
+        );
+
+        let marker = engine
+            .lock()
+            .expect("engine lock should not be poisoned")
+            .submit(|| 7)
+            .expect("engine should remain usable");
+        assert_eq!(marker.wait(), Ok(7));
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock should not be poisoned")
+                .shutdown(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn dropping_final_engine_reference_on_worker_drains_accepted_tasks() {
+        let engine = Arc::new(Mutex::new(
+            Engine::new(test_config(2, 32)).expect("configuration should be valid"),
+        ));
+        let (blocker_started_sender, blocker_started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        let blocker = engine
+            .lock()
+            .expect("engine lock should not be poisoned")
+            .submit(move || {
+                blocker_started_sender
+                    .send(())
+                    .expect("blocker start receiver should be available");
+                release_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("blocker should be released");
+                1
+            })
+            .expect("blocker should be accepted");
+        blocker_started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("blocker should start");
+
+        let (drop_started_sender, drop_started_receiver) = mpsc::channel();
+        let (drop_proceed_sender, drop_proceed_receiver) = mpsc::channel();
+        let (drop_done_sender, drop_done_receiver) = mpsc::channel();
+        let worker_engine = Arc::clone(&engine);
+        let destructor = engine
+            .lock()
+            .expect("engine lock should not be poisoned")
+            .submit(move || {
+                drop_started_sender
+                    .send(())
+                    .expect("destructor start receiver should be available");
+                drop_proceed_receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("destructor should be released");
+                drop(worker_engine);
+                drop_done_sender
+                    .send(())
+                    .expect("destructor completion receiver should be available");
+            })
+            .expect("destructor should be accepted");
+        drop_started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("destructor should start");
+
+        let queued: Vec<_> = (0..8)
+            .map(|value| {
+                engine
+                    .lock()
+                    .expect("engine lock should not be poisoned")
+                    .submit(move || value)
+                    .expect("queued task should be accepted")
+            })
+            .collect();
+
+        drop(engine);
+        drop_proceed_sender
+            .send(())
+            .expect("destructor should be released");
+        drop_done_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("destructor should drop the final engine reference");
+
+        release_sender.send(()).expect("blocker should be released");
+
+        assert_eq!(blocker.wait(), Ok(1));
+        assert_eq!(destructor.wait(), Ok(()));
+        for (index, handle) in queued.into_iter().enumerate() {
+            assert_eq!(handle.wait(), Ok(index));
+        }
+    }
+
+    #[test]
+    fn concurrent_submit_and_shutdown_admit_or_reject_deterministically() {
+        const SUBMITTERS: usize = 4;
+        const TASKS_PER_SUBMITTER: usize = 64;
+        const TOTAL_TASKS: usize = SUBMITTERS * TASKS_PER_SUBMITTER;
+
+        let engine = Arc::new(Mutex::new(
+            Engine::new(test_config(2, TOTAL_TASKS)).expect("configuration should be valid"),
+        ));
+        let barrier = Arc::new(Barrier::new(SUBMITTERS + 1));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let handles = Arc::new(Mutex::new(Vec::new()));
+
+        thread::scope(|scope| {
+            for _ in 0..SUBMITTERS {
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+                let accepted = Arc::clone(&accepted);
+                let rejected = Arc::clone(&rejected);
+                let handles = Arc::clone(&handles);
+
+                scope.spawn(move || {
+                    barrier.wait();
+
+                    for _ in 0..TASKS_PER_SUBMITTER {
+                        match engine
+                            .lock()
+                            .expect("engine lock should not be poisoned")
+                            .submit(|| 1)
+                        {
+                            Ok(handle) => {
+                                accepted.fetch_add(1, Ordering::SeqCst);
+                                handles
+                                    .lock()
+                                    .expect("handles lock should not be poisoned")
+                                    .push(handle);
+                            }
+                            Err(EngineError::AlreadyShutdown) => {
+                                rejected.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Err(error) => panic!("unexpected submission error: {error}"),
+                        }
+                    }
+                });
+            }
+
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                assert_eq!(
+                    engine
+                        .lock()
+                        .expect("engine lock should not be poisoned")
+                        .shutdown(),
+                    Ok(())
+                );
+            });
+        });
+
+        assert_eq!(
+            accepted.load(Ordering::SeqCst) + rejected.load(Ordering::SeqCst),
+            TOTAL_TASKS
+        );
+        let handles = Arc::try_unwrap(handles)
+            .expect("handles should have a single owner")
+            .into_inner()
+            .expect("handles lock should not be poisoned");
+        assert_eq!(handles.len(), accepted.load(Ordering::SeqCst));
+
+        for handle in handles {
+            assert_eq!(handle.wait(), Ok(1));
+        }
     }
 
     #[test]

@@ -14,6 +14,11 @@ chained through `__context__`. Calling `shutdown()` manually inside the block
 is allowed: a normal block exit ignores the duplicate shutdown, while an
 exceptional exit still reports the shutdown error.
 
+Shutdown must be requested from outside the engine's worker callbacks. Calling
+`shutdown()` from a callback raises `RuntimeError` without closing the engine.
+If the final `Engine` reference is released inside a callback, the remaining
+workers drain accepted tasks and shut down safely.
+
 Example:
     from fluxion import Engine
 

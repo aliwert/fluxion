@@ -29,12 +29,32 @@ impl PyEngine {
     }
 
     fn shutdown_inner(&self, py: Python<'_>) -> Result<(), EngineError> {
-        let mut engine = {
+        let engine = {
             let mut inner = self.lock_inner();
+
+            if inner
+                .as_ref()
+                .is_some_and(|engine| engine.is_worker_thread())
+            {
+                return Err(EngineError::ShutdownFromWorker);
+            }
+
             inner.take().ok_or(EngineError::AlreadyShutdown)?
         };
 
-        py.detach(move || engine.shutdown())
+        let (result, engine) = py.detach(move || {
+            let mut engine = engine;
+            let result = engine.shutdown();
+            (result, engine)
+        });
+
+        if matches!(&result, Err(EngineError::ShutdownFromWorker)) {
+            let mut inner = self.lock_inner();
+            debug_assert!(inner.is_none());
+            *inner = Some(engine);
+        }
+
+        result
     }
 }
 
@@ -154,8 +174,12 @@ impl PyEngine {
     ///
     /// The GIL is released while waiting so pending Python callbacks can
     /// complete. Results remain available through existing task handles.
-    /// Calling `shutdown` again raises `RuntimeError`. Do not call `shutdown`
-    /// from inside a callback submitted to this engine.
+    /// Calling `shutdown` again raises `RuntimeError`.
+    ///
+    /// Calling `shutdown` from one of this engine's worker callbacks raises
+    /// ``RuntimeError`` without closing the queue or changing engine state.
+    /// The engine remains usable and shutdown must be requested from another
+    /// thread.
     fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
         self.shutdown_inner(py).map_err(engine_error)
     }

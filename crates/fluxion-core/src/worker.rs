@@ -3,16 +3,22 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread::{self, JoinHandle, ThreadId};
 
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::queue::{QueueError, TaskQueue};
 
+struct WorkerThread {
+    index: usize,
+    id: ThreadId,
+    handle: JoinHandle<()>,
+}
+
 /// Owns the engine's worker threads and their shared task queue.
 pub(crate) struct WorkerPool {
     queue: Arc<TaskQueue>,
-    workers: Vec<JoinHandle<()>>,
+    workers: Vec<WorkerThread>,
 }
 
 impl WorkerPool {
@@ -32,11 +38,15 @@ impl WorkerPool {
                 });
 
             match spawn_result {
-                Ok(handle) => workers.push(handle),
+                Ok(handle) => workers.push(WorkerThread {
+                    index: worker_index,
+                    id: handle.thread().id(),
+                    handle,
+                }),
                 Err(source) => {
                     queue.close();
                     for worker in workers.drain(..) {
-                        let _ = worker.join();
+                        let _ = worker.handle.join();
                     }
                     return Err(EngineError::WorkerSpawnFailed {
                         worker_index,
@@ -57,6 +67,10 @@ impl WorkerPool {
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), EngineError> {
+        if self.is_worker_thread(thread::current().id()) {
+            return Err(EngineError::ShutdownFromWorker);
+        }
+
         self.queue.close();
 
         match self.join_workers() {
@@ -65,23 +79,59 @@ impl WorkerPool {
         }
     }
 
-    fn join_workers(&mut self) -> Option<EngineError> {
-        let mut first_failure = None;
-
-        for (worker_index, worker) in self.workers.drain(..).enumerate() {
-            if worker.join().is_err() && first_failure.is_none() {
-                first_failure = Some(EngineError::WorkerFailed { worker_index });
-            }
-        }
-
-        first_failure
+    pub(crate) fn is_worker_thread(&self, thread_id: ThreadId) -> bool {
+        self.workers.iter().any(|worker| worker.id == thread_id)
     }
+
+    fn join_workers(&mut self) -> Option<EngineError> {
+        join_worker_threads(std::mem::take(&mut self.workers))
+    }
+
+    /// Drops a pool whose final owner is one of its own workers.
+    ///
+    /// The current worker cannot join itself. A dedicated reaper thread closes
+    /// the queue, drains accepted tasks through the existing workers, and joins
+    /// every worker after the callback returns. If the reaper cannot be
+    /// spawned, the queue is closed and the remaining handles are detached so
+    /// workers can still drain accepted tasks and exit.
+    fn shutdown_from_current_worker(&mut self) {
+        let queue = Arc::clone(&self.queue);
+        let workers = std::mem::take(&mut self.workers);
+        let spawn_result = thread::Builder::new()
+            .name(String::from("fluxion-worker-reaper"))
+            .spawn(move || {
+                queue.close();
+                let _ = join_worker_threads(workers);
+            });
+
+        if spawn_result.is_err() {
+            self.queue.close();
+        }
+    }
+}
+
+fn join_worker_threads(workers: Vec<WorkerThread>) -> Option<EngineError> {
+    let mut first_failure = None;
+
+    for worker in workers {
+        if worker.handle.join().is_err() && first_failure.is_none() {
+            first_failure = Some(EngineError::WorkerFailed {
+                worker_index: worker.index,
+            });
+        }
+    }
+
+    first_failure
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        self.queue.close();
-        let _ = self.join_workers();
+        if self.is_worker_thread(thread::current().id()) {
+            self.shutdown_from_current_worker();
+        } else {
+            self.queue.close();
+            let _ = self.join_workers();
+        }
     }
 }
 
