@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 import subprocess
 import sys
@@ -587,6 +588,432 @@ def test_completed_status_is_visible_before_wait():
         assert handle.status == "completed"
     finally:
         engine.shutdown()
+
+
+def test_submit_async_returns_future_bound_to_running_loop():
+    async def main():
+        loop = asyncio.get_running_loop()
+        engine = Engine(worker_count=2, queue_capacity=8)
+        try:
+            future = engine.submit_async(lambda: 42)
+
+            assert isinstance(future, asyncio.Future)
+            assert future.get_loop() is loop
+            assert not future.done()
+            assert await future == 42
+        finally:
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_from_background_event_loop_thread():
+    started = threading.Event()
+    result = {}
+    errors = []
+
+    def run_loop():
+        async def main():
+            loop = asyncio.get_running_loop()
+            engine = Engine(worker_count=1, queue_capacity=8)
+            try:
+                future = engine.submit_async(lambda: 42)
+                assert future.get_loop() is loop
+                started.set()
+                result["value"] = await future
+            finally:
+                engine.shutdown()
+
+        try:
+            asyncio.run(main())
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run_loop)
+    thread.start()
+    try:
+        assert started.wait(5)
+        thread.join(5)
+        assert not thread.is_alive()
+        assert errors == []
+        assert result["value"] == 42
+    finally:
+        thread.join(5)
+
+
+def test_submit_async_requires_a_running_event_loop():
+    engine = Engine(worker_count=1, queue_capacity=4)
+    try:
+        with pytest.raises(RuntimeError, match="running event loop"):
+            engine.submit_async(lambda: 1)
+    finally:
+        engine.shutdown()
+
+
+def test_submit_async_rejects_non_callable_and_submissions_after_shutdown():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=4)
+        try:
+            with pytest.raises(TypeError, match="not callable"):
+                engine.submit_async(42)
+
+            engine.shutdown()
+            with pytest.raises(RuntimeError, match="shut down"):
+                engine.submit_async(lambda: 1)
+        finally:
+            with pytest.raises(RuntimeError, match="shut down"):
+                engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_queue_full_does_not_leave_unobserved_error():
+    async def main():
+        loop = asyncio.get_running_loop()
+        messages = []
+        loop.set_exception_handler(lambda _loop, context: messages.append(context))
+        engine = Engine(worker_count=1, queue_capacity=1)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_task():
+            started.set()
+            assert release.wait(5)
+            return "first"
+
+        try:
+            first = engine.submit(blocking_task)
+            assert await asyncio.to_thread(started.wait, 5)
+            second = engine.submit(lambda: "second")
+
+            with pytest.raises(RuntimeError, match="queue is full"):
+                engine.submit_async(lambda: "third")
+
+            await asyncio.sleep(0)
+            assert not messages
+
+            release.set()
+            assert await asyncio.to_thread(first.wait, 5) == "first"
+            assert await asyncio.to_thread(second.wait, 5) == "second"
+        finally:
+            release.set()
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_preserves_callback_exception_identity():
+    class CallbackError(Exception):
+        pass
+
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        error = CallbackError("async callback failed")
+
+        def fail():
+            raise error
+
+        try:
+            future = engine.submit_async(fail)
+
+            with pytest.raises(CallbackError, match="async callback failed") as caught:
+                await future
+
+            assert caught.value is error
+            assert caught.value.__traceback__ is not None
+        finally:
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_multiple_concurrent_submissions():
+    async def main():
+        engine = Engine(worker_count=2, queue_capacity=64)
+        try:
+            futures = [
+                engine.submit_async(lambda value=value: value * 2)
+                for value in range(16)
+            ]
+
+            assert await asyncio.gather(*futures) == [value * 2 for value in range(16)]
+        finally:
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_queued_cancellation_prevents_execution():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        started = threading.Event()
+        release = threading.Event()
+        executed = []
+
+        def blocker():
+            started.set()
+            assert release.wait(5)
+
+        try:
+            blocker_handle = engine.submit(blocker)
+            assert await asyncio.to_thread(started.wait, 5)
+
+            future = engine.submit_async(lambda: executed.append(True))
+            assert not future.done()
+            assert future.cancel() is True
+
+            with pytest.raises(asyncio.CancelledError):
+                await future
+
+            release.set()
+            marker = engine.submit(lambda: 17)
+            assert await asyncio.to_thread(marker.wait, 5) == 17
+            assert await asyncio.to_thread(blocker_handle.wait, 5) is None
+            assert executed == []
+        finally:
+            release.set()
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_cancel_accepts_message_keyword():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            future = engine.submit_async(lambda: 42)
+
+            if sys.version_info < (3, 11):
+                with pytest.raises(TypeError):
+                    future.cancel(msg="cancelled by test")
+                assert await future == 42
+            else:
+                assert future.cancel(msg="cancelled by test") is True
+                with pytest.raises(asyncio.CancelledError) as caught:
+                    await future
+                assert caught.value.args == ("cancelled by test",)
+        finally:
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_wait_for_timeout_cancels_task_awaiting_future():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        started = threading.Event()
+        release = threading.Event()
+        executed = []
+
+        def callback():
+            started.set()
+            assert release.wait(5)
+            executed.append(True)
+            return "done"
+
+        try:
+            future = engine.submit_async(callback)
+            assert await asyncio.to_thread(started.wait, 5)
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(future, 0.05)
+            assert future.cancelled()
+
+            release.set()
+            marker = engine.submit(lambda: 11)
+            assert await asyncio.to_thread(marker.wait, 5) == 11
+            assert executed == [True]
+        finally:
+            release.set()
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_cancellation_after_start_does_not_interrupt_callback():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        started = threading.Event()
+        release = threading.Event()
+        executed = []
+
+        def callback():
+            started.set()
+            assert release.wait(5)
+            executed.append(True)
+            return 7
+
+        try:
+            future = engine.submit_async(callback)
+            assert await asyncio.to_thread(started.wait, 5)
+            assert future.cancel() is True
+
+            with pytest.raises(asyncio.CancelledError):
+                await future
+
+            release.set()
+            marker = engine.submit(lambda: 11)
+            assert await asyncio.to_thread(marker.wait, 5) == 11
+            assert executed == [True]
+            assert future.cancelled()
+        finally:
+            release.set()
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_cancel_after_completion_preserves_result():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            future = engine.submit_async(lambda: 42)
+            assert await future == 42
+
+            assert future.cancel() is False
+            assert future.result() == 42
+        finally:
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_cancellation_completion_races_are_safe():
+    async def main():
+        engine = Engine(worker_count=2, queue_capacity=64)
+        try:
+            for _ in range(64):
+                future = engine.submit_async(lambda: 1)
+                await asyncio.sleep(0)
+
+                if future.cancel():
+                    with pytest.raises(asyncio.CancelledError):
+                        await future
+                else:
+                    assert await future == 1
+
+                await asyncio.sleep(0)
+        finally:
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_discards_result_after_event_loop_closed():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+    loop = asyncio.new_event_loop()
+    shutdown = False
+
+    async def submit():
+        def callback():
+            started.set()
+            assert release.wait(5)
+            return "done"
+
+        return engine.submit_async(callback)
+
+    try:
+        future = loop.run_until_complete(submit())
+        assert started.wait(5)
+        loop.close()
+        release.set()
+
+        engine.shutdown()
+        shutdown = True
+
+        assert not future.done()
+    finally:
+        release.set()
+        if not loop.is_closed():
+            loop.close()
+        if not shutdown:
+            engine.shutdown()
+
+
+def test_submit_async_keeps_event_loop_responsive():
+    async def main():
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        engine = Engine(worker_count=1, queue_capacity=8)
+
+        def callback():
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+            return "done"
+
+        try:
+            future = engine.submit_async(callback)
+            await asyncio.wait_for(started.wait(), 5)
+
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            assert not future.done()
+            release.set()
+            assert await asyncio.wait_for(future, 5) == "done"
+        finally:
+            release.set()
+            engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_engine_shutdown_with_pending_async_tasks_completes_futures():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        started = threading.Event()
+        release = threading.Event()
+        shutdown = False
+
+        def blocking_task():
+            started.set()
+            assert release.wait(5)
+            return "first"
+
+        try:
+            first = engine.submit_async(blocking_task)
+            second = engine.submit_async(lambda: "second")
+            assert await asyncio.to_thread(started.wait, 5)
+
+            shutdown_task = asyncio.create_task(asyncio.to_thread(engine.shutdown))
+            release.set()
+            await asyncio.wait_for(shutdown_task, 5)
+            shutdown = True
+
+            assert await asyncio.wait_for(first, 5) == "first"
+            assert await asyncio.wait_for(second, 5) == "second"
+        finally:
+            release.set()
+            if not shutdown:
+                engine.shutdown()
+
+    asyncio.run(main())
+
+
+def test_submit_async_completes_future_on_event_loop_thread():
+    async def main():
+        loop_thread = threading.get_ident()
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            future = engine.submit_async(lambda: 42)
+            observed_threads = []
+            set_result = future.set_result
+
+            def checked_set_result(value):
+                observed_threads.append(threading.get_ident())
+                set_result(value)
+
+            future.set_result = checked_set_result
+
+            assert await future == 42
+            assert observed_threads == [loop_thread]
+        finally:
+            engine.shutdown()
+
+    asyncio.run(main())
 
 
 def test_engine_context_manager_shuts_down_on_exit():

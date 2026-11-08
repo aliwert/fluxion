@@ -9,6 +9,23 @@ use crate::error::{task_error, timeout_error};
 
 pub(crate) type PythonTaskResult = Result<Py<PyAny>, PyErr>;
 
+pub(crate) fn call_python_callable_then<F>(callable: Py<PyAny>, after: F) -> PythonTaskResult
+where
+    F: for<'py> FnOnce(Python<'py>, &PythonTaskResult),
+{
+    match Python::try_attach(move |py| {
+        let result = callable.call0(py);
+        drop(callable);
+        after(py, &result);
+        result
+    }) {
+        Some(result) => result,
+        None => Err(PyRuntimeError::new_err(
+            "Python interpreter is not available to execute callback",
+        )),
+    }
+}
+
 /// Shared Python-level flag indicating that a callback raised.
 ///
 /// The Rust core sees a Python exception as a successfully returned

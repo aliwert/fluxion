@@ -1,12 +1,15 @@
-use std::sync::{Mutex, MutexGuard};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use fluxion_core::{Engine, EngineConfig, EngineError};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
 
+use crate::asyncio::{AsyncCompletion, AsyncTaskHandle, cancellation_callback, new_future};
 use crate::error::engine_error;
-use crate::task::{CallbackFailure, PyTaskHandle, PythonTaskResult};
+use crate::task::{CallbackFailure, PyTaskHandle, PythonTaskResult, call_python_callable_then};
 
 /// Runs Python callables on Fluxion's Rust-managed worker threads.
 ///
@@ -137,6 +140,77 @@ impl PyEngine {
             .map_err(engine_error)?;
 
         Ok(PyTaskHandle::new(handle, callback_failure))
+    }
+
+    /// Submits a zero-argument Python callable and returns an asyncio Future.
+    ///
+    /// The method must be called from a thread with a running asyncio event
+    /// loop. The returned Future is bound to that loop and must be awaited from
+    /// the same loop. It is completed through ``loop.call_soon_threadsafe``;
+    /// worker threads never complete or cancel the Future directly.
+    ///
+    /// Cancelling the Future before execution starts cancels the queued Rust
+    /// task. Once the callback has started, cancellation does not interrupt it;
+    /// the Future is still cancelled normally and any later result is discarded.
+    /// Callback exceptions are preserved, while task panics and worker
+    /// disconnections raise ``RuntimeError``.
+    fn submit_async(&self, py: Python<'_>, callable: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        if !callable.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("submitted object is not callable"));
+        }
+
+        let asyncio = py.import("asyncio")?;
+        let event_loop = asyncio.getattr("get_running_loop")?.call0()?;
+
+        let active = Arc::new(AtomicBool::new(false));
+        let handle_slot: AsyncTaskHandle = Arc::new(Mutex::new(None));
+        let cancellation =
+            cancellation_callback(py, Arc::clone(&handle_slot), Arc::clone(&active))?;
+        let future = new_future(py, &event_loop, cancellation)?;
+
+        let mut completion = AsyncCompletion::new(
+            event_loop.unbind(),
+            future.clone_ref(py),
+            Arc::clone(&active),
+        );
+
+        let task = move || -> PythonTaskResult {
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                call_python_callable_then(callable, |py, result| completion.complete(py, result))
+            }));
+
+            match outcome {
+                Ok(result) => result,
+                Err(payload) => {
+                    completion.panicked();
+                    panic::resume_unwind(payload);
+                }
+            }
+        };
+
+        let inner = self.lock_inner();
+        let engine = inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine has already been shut down"))?;
+
+        active.store(true, Ordering::Release);
+        let submit_result = engine.submit(task).map_err(engine_error);
+        drop(inner);
+
+        let handle = match submit_result {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = future.bind(py).call_method0("cancel");
+                return Err(error);
+            }
+        };
+
+        match handle_slot.lock() {
+            Ok(mut guard) => *guard = Some(handle),
+            Err(poisoned) => *poisoned.into_inner() = Some(handle),
+        }
+
+        Ok(future)
     }
 
     /// Enters the engine context manager and returns the engine.

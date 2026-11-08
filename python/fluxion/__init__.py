@@ -19,12 +19,27 @@ Shutdown must be requested from outside the engine's worker callbacks. Calling
 If the final `Engine` reference is released inside a callback, the remaining
 workers drain accepted tasks and shut down safely.
 
+`Engine.submit_async` is available only while an asyncio event loop is running.
+It returns an `asyncio.Future` bound to that loop and must be awaited from the
+same loop. Results are delivered on the loop through `call_soon_threadsafe`;
+worker threads never complete futures directly. Cancelling the future before
+execution starts cancels the queued Rust task, while a callback that has already
+started is allowed to finish. Awaiting a cancelled future raises
+`asyncio.CancelledError`.
+
 Example:
+    import asyncio
     from fluxion import Engine
 
     with Engine(worker_count=4, queue_capacity=1024) as engine:
         handle = engine.submit(lambda: 42)
         assert handle.wait() == 42
+
+        async def compute():
+            future = engine.submit_async(lambda: 21 * 2)
+            return await future
+
+        assert asyncio.run(compute()) == 42
 
     engine = Engine()
     try:
