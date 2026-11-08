@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import inspect
 import subprocess
 import sys
 import textwrap
@@ -782,8 +783,11 @@ def test_submit_async_cancel_accepts_message_keyword():
         engine = Engine(worker_count=1, queue_capacity=8)
         try:
             future = engine.submit_async(lambda: 42)
+            supports_cancel_message = (
+                "msg" in inspect.signature(asyncio.Future.cancel).parameters
+            )
 
-            if sys.version_info < (3, 11):
+            if not supports_cancel_message:
                 with pytest.raises(TypeError):
                     future.cancel(msg="cancelled by test")
                 assert await future == 42
