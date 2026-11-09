@@ -1,17 +1,36 @@
 import asyncio
 import concurrent.futures
+import gc
 import inspect
+import os
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+import warnings
 from importlib.metadata import version
+from importlib.resources import files
 
 import pytest
 
 import fluxion
-from fluxion import Engine, TaskHandle
+from fluxion import (
+    Engine,
+    EngineClosedError,
+    EngineError,
+    EngineState,
+    FluxionError,
+    ForkedProcessError,
+    QueueFullError,
+    TaskCancelledError,
+    TaskError,
+    TaskHandle,
+    TaskPanicError,
+    TaskStatus,
+    TaskTimeoutError,
+    WorkerDisconnectedError,
+)
 
 
 def run_isolated(source, timeout=10):
@@ -29,8 +48,10 @@ def test_public_api_is_exposed():
     assert version("fluxion") == fluxion.__version__
     assert Engine.__name__ == "Engine"
     assert TaskHandle.__name__ == "TaskHandle"
-    assert Engine.__module__ == "fluxion._core"
-    assert TaskHandle.__module__ == "fluxion._core"
+    assert Engine.__module__ == "fluxion"
+    assert TaskHandle.__module__ == "fluxion"
+    assert TaskStatus.QUEUED == "queued"
+    assert EngineState.RUNNING == "running"
 
 
 def test_engine_configuration_is_exposed():
@@ -63,9 +84,18 @@ def test_invalid_configuration_raises_value_error(kwargs):
         Engine(**kwargs)
 
 
-def test_negative_configuration_raises_overflow_error():
-    with pytest.raises(OverflowError):
+def test_negative_configuration_raises_value_error():
+    with pytest.raises(ValueError):
         Engine(worker_count=-1)
+
+    with pytest.raises(ValueError):
+        Engine(queue_capacity=-1)
+
+    with pytest.raises(ValueError):
+        Engine(worker_count=True)
+
+    with pytest.raises(TypeError):
+        Engine(worker_count="2")
 
 
 def test_submit_and_wait_return_python_objects():
@@ -160,8 +190,7 @@ def test_submit_after_shutdown_raises_runtime_error():
     with pytest.raises(RuntimeError, match="shut down"):
         engine.submit(lambda: 1)
 
-    with pytest.raises(RuntimeError, match="shut down"):
-        engine.shutdown()
+    assert engine.shutdown() is None
 
 
 def test_submit_rejects_non_callable():
@@ -298,8 +327,106 @@ def test_shutdown_from_worker_callback_is_rejected_and_engine_remains_usable():
     finally:
         engine.shutdown()
 
-    with pytest.raises(RuntimeError, match="already been shut down"):
+    assert engine.shutdown() is None
+
+
+def test_worker_close_during_concurrent_close_is_rejected_without_deadlock():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    callback_done = threading.Event()
+    close_done = threading.Event()
+    errors = []
+
+    def callback():
+        callback_started.set()
+        assert release_callback.wait(5)
+        try:
+            engine.close()
+        except RuntimeError as error:
+            errors.append(error)
+        finally:
+            callback_done.set()
+        return 42
+
+    handle = engine.submit(callback)
+    assert callback_started.wait(5)
+
+    def close_engine():
+        engine.close()
+        close_done.set()
+
+    closer = threading.Thread(target=close_engine, daemon=True)
+    closer.start()
+
+    deadline = time.monotonic() + 5
+    while engine.state is not EngineState.CLOSING:
+        assert time.monotonic() < deadline, "engine did not enter closing state"
+        time.sleep(0.001)
+
+    release_callback.set()
+    assert callback_done.wait(5), "worker close deadlocked"
+    assert close_done.wait(5)
+    closer.join(5)
+    assert not closer.is_alive()
+
+    assert handle.wait(5) == 42
+    assert errors
+    assert "cannot be shut down from one of its worker threads" in str(errors[0])
+    assert engine.state is EngineState.CLOSED
+
+
+def test_async_close_from_worker_callback_is_rejected():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    errors = []
+
+    def callback():
+        try:
+            engine.aclose()
+        except RuntimeError as error:
+            errors.append(error)
+        return 42
+
+    try:
+        assert engine.submit(callback).wait() == 42
+        assert len(errors) == 1
+        assert "cannot be shut down from one of its worker threads" in str(errors[0])
+        assert engine.submit(lambda: 7).wait() == 7
+    finally:
         engine.shutdown()
+
+
+def test_precreated_aclose_awaited_from_worker_fails_without_deadlock():
+    result = run_isolated(
+        """
+        import asyncio
+        from fluxion import Engine, EngineError
+
+        engine = Engine(worker_count=1, queue_capacity=8)
+        close_coroutine = engine.aclose()
+        errors = []
+
+        def callback():
+            try:
+                asyncio.run(close_coroutine)
+            except EngineError as error:
+                errors.append(error)
+            else:
+                raise AssertionError("pre-created aclose() did not fail")
+            return 42
+
+        try:
+            assert engine.submit(callback).wait(5) == 42
+            assert len(errors) == 1
+            assert "cannot be shut down from one of its worker threads" in str(errors[0])
+            assert engine.submit(lambda: 7).wait(5) == 7
+        finally:
+            engine.close()
+        """,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_engine_destruction_from_worker_callback_drains_accepted_tasks():
@@ -662,8 +789,7 @@ def test_submit_async_rejects_non_callable_and_submissions_after_shutdown():
             with pytest.raises(RuntimeError, match="shut down"):
                 engine.submit_async(lambda: 1)
         finally:
-            with pytest.raises(RuntimeError, match="shut down"):
-                engine.shutdown()
+            engine.shutdown()
 
     asyncio.run(main())
 
@@ -1027,8 +1153,7 @@ def test_engine_context_manager_shuts_down_on_exit():
     with pytest.raises(RuntimeError, match="shut down"):
         engine.submit(lambda: 1)
 
-    with pytest.raises(RuntimeError, match="shut down"):
-        engine.shutdown()
+    assert engine.shutdown() is None
 
 
 def test_engine_context_manager_propagates_block_exception_and_shuts_down():
@@ -1058,17 +1183,258 @@ def test_engine_context_manager_ignores_duplicate_shutdown_on_clean_exit():
         engine.submit(lambda: 1)
 
 
-def test_engine_context_manager_shutdown_error_takes_precedence():
+def test_engine_context_manager_preserves_block_exception_after_duplicate_close():
     class BlockError(Exception):
         pass
 
     engine = Engine(worker_count=1, queue_capacity=4)
 
-    with pytest.raises(RuntimeError, match="engine has already been shut down") as caught:
+    with pytest.raises(BlockError, match="block failed"):
         with engine:
-            engine.shutdown()
+            engine.close()
             raise BlockError("block failed")
 
-    assert isinstance(caught.value.__context__, BlockError)
-    assert caught.value.__cause__ is None
-    assert not caught.value.__suppress_context__
+    assert engine.closed
+    assert engine.state is EngineState.CLOSED
+
+
+def test_packaged_typing_metadata_is_available():
+    package = files("fluxion")
+    assert (package / "py.typed").is_file()
+    assert (package / "__init__.pyi").is_file()
+    assert (package / "errors.pyi").is_file()
+    assert (package / "status.pyi").is_file()
+    assert "TaskHandle" in repr(TaskHandle[int])
+
+
+def test_exception_hierarchy_is_public_and_backward_compatible():
+    assert issubclass(FluxionError, Exception)
+    assert issubclass(EngineError, RuntimeError)
+    assert issubclass(EngineClosedError, EngineError)
+    assert issubclass(QueueFullError, EngineError)
+    assert issubclass(ForkedProcessError, EngineError)
+    assert issubclass(ForkedProcessError, RuntimeError)
+    assert issubclass(TaskError, FluxionError)
+    assert issubclass(TaskCancelledError, concurrent.futures.CancelledError)
+    assert issubclass(TaskTimeoutError, TimeoutError)
+    assert issubclass(TaskTimeoutError, concurrent.futures.TimeoutError)
+    assert issubclass(TaskPanicError, RuntimeError)
+    assert issubclass(WorkerDisconnectedError, RuntimeError)
+
+
+def test_status_and_engine_state_are_typed_and_string_compatible():
+    engine = Engine(worker_count=1, queue_capacity=4)
+    try:
+        assert engine.state is EngineState.RUNNING
+        assert not engine.closed
+
+        handle = engine.submit(lambda: 42)
+        assert handle.wait() == 42
+        assert handle.status is TaskStatus.COMPLETED
+        assert handle.status == "completed"
+        assert str(handle.status) == "completed"
+        assert "completed" in repr(handle)
+        assert "state='running'" in repr(engine)
+    finally:
+        engine.close()
+
+    assert engine.state is EngineState.CLOSED
+    assert engine.closed
+    assert "state='closed'" in repr(engine)
+
+
+def test_configuration_rejects_bools_non_integers_and_out_of_range_values():
+    with pytest.raises(ValueError):
+        Engine(worker_count=True)
+
+    with pytest.raises(ValueError):
+        Engine(queue_capacity=False)
+
+    with pytest.raises(TypeError):
+        Engine(worker_count="2")
+
+    with pytest.raises(TypeError):
+        Engine(queue_capacity=1.5)
+
+    with pytest.raises(ValueError):
+        Engine(worker_count=10**100)
+
+
+def test_timeout_and_cancellation_errors_have_public_types():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_task():
+        started.set()
+        assert release.wait(5)
+        return 42
+
+    try:
+        handle = engine.submit(blocking_task)
+        assert started.wait(5)
+
+        with pytest.raises(TaskTimeoutError) as caught:
+            handle.wait(timeout=0.01)
+
+        assert isinstance(caught.value, TimeoutError)
+        assert isinstance(caught.value, concurrent.futures.TimeoutError)
+
+        queued = engine.submit(lambda: 42)
+        assert queued.cancel()
+        with pytest.raises(TaskCancelledError) as caught:
+            queued.wait()
+
+        assert isinstance(caught.value, concurrent.futures.CancelledError)
+    finally:
+        release.set()
+        engine.close()
+
+
+def test_submit_async_rejects_coroutine_functions_and_awaitable_results():
+    async def coroutine_function():
+        return 1
+
+    class AsyncCallable:
+        async def __call__(self):
+            return 1
+
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            with pytest.raises(TypeError, match="synchronous callable"):
+                engine.submit_async(coroutine_function)
+
+            with pytest.raises(TypeError, match="synchronous callable"):
+                engine.submit_async(AsyncCallable())
+
+            future = engine.submit_async(lambda: coroutine_function())
+            with pytest.raises(TypeError, match="returned an awaitable"):
+                await future
+
+            assert await engine.submit_async(lambda: 42) == 42
+        finally:
+            engine.close()
+
+    asyncio.run(main())
+
+
+def test_submit_async_closes_rejected_coroutine_results():
+    async def coroutine_function():
+        return 1
+
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=4)
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                future = engine.submit_async(lambda: coroutine_function())
+                with pytest.raises(TypeError, match="returned an awaitable"):
+                    await future
+                del future
+                gc.collect()
+
+            assert not [
+                warning
+                for warning in caught
+                if issubclass(warning.category, RuntimeWarning)
+            ]
+        finally:
+            engine.close()
+
+    asyncio.run(main())
+
+
+def test_aclose_and_async_context_manager_do_not_block_the_event_loop():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        started = threading.Event()
+        release = threading.Event()
+        ticks = 0
+
+        def blocking_task():
+            started.set()
+            assert release.wait(5)
+            return "finished"
+
+        handle = engine.submit(blocking_task)
+        assert await asyncio.to_thread(started.wait, 5)
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.005)
+                ticks += 1
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        close_task = asyncio.create_task(engine.aclose())
+        await asyncio.sleep(0.05)
+        assert ticks > 0
+
+        release.set()
+        await asyncio.wait_for(close_task, 5)
+        heartbeat_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await heartbeat_task
+
+        assert handle.wait() == "finished"
+        engine.close()
+        engine.shutdown()
+        assert engine.closed
+
+        async with Engine(worker_count=1, queue_capacity=4) as entered:
+            assert entered.state is EngineState.RUNNING
+            assert await entered.submit_async(lambda: 21 * 2) == 42
+        assert entered.closed
+
+        with pytest.raises(ValueError, match="block failed"):
+            async with Engine(worker_count=1, queue_capacity=4) as entered:
+                raise ValueError("block failed")
+        assert entered.closed
+
+    asyncio.run(main())
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is unavailable")
+def test_engine_and_handle_reject_forked_child_process():
+    result = run_isolated(
+        """
+        import os
+        from fluxion import Engine, EngineState, ForkedProcessError
+
+        engine = Engine(worker_count=1, queue_capacity=8)
+        handle = engine.submit(lambda: 42)
+        assert handle.wait() == 42
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                assert engine.closed
+                assert engine.state is EngineState.CLOSED
+
+                operations = [
+                    lambda: engine.submit(lambda: 1),
+                    lambda: handle.wait(0.1),
+                    lambda: handle.status,
+                    lambda: handle.cancel(),
+                    lambda: engine.close(),
+                    lambda: engine.shutdown(),
+                ]
+                for operation in operations:
+                    try:
+                        operation()
+                    except ForkedProcessError:
+                        pass
+                    else:
+                        raise AssertionError("forked operation did not raise")
+            except BaseException:
+                os._exit(1)
+            os._exit(0)
+
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        engine.close()
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
