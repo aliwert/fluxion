@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fluxion_core::{TaskError, TaskHandle};
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyCFunction};
 
+use crate::error::task_error;
 use crate::task::PythonTaskResult;
 
 pub(crate) type AsyncTaskHandle = Arc<Mutex<Option<TaskHandle<PythonTaskResult>>>>;
@@ -81,15 +81,12 @@ impl AsyncCompletion {
 
     pub(crate) fn panicked(&mut self) {
         self.completed = true;
-        self.schedule_error(TaskError::Panicked.to_string());
+        self.schedule_error(TaskError::Panicked);
     }
 
-    fn schedule_error(&self, message: String) {
+    fn schedule_error(&self, error: TaskError) {
         let _ = Python::try_attach(|py| {
-            self.schedule(
-                py,
-                CompletionPayload::Exception(PyRuntimeError::new_err(message)),
-            );
+            self.schedule(py, CompletionPayload::Exception(task_error(py, error)));
         });
     }
 
@@ -125,7 +122,7 @@ impl AsyncCompletion {
 impl Drop for AsyncCompletion {
     fn drop(&mut self) {
         if !self.completed && self.active.load(Ordering::Acquire) {
-            self.schedule_error(TaskError::WorkerDisconnected.to_string());
+            self.schedule_error(TaskError::WorkerDisconnected);
         }
     }
 }

@@ -83,6 +83,10 @@ impl WorkerPool {
         self.workers.iter().any(|worker| worker.id == thread_id)
     }
 
+    pub(crate) fn thread_ids(&self) -> Vec<ThreadId> {
+        self.workers.iter().map(|worker| worker.id).collect()
+    }
+
     fn join_workers(&mut self) -> Option<EngineError> {
         join_worker_threads(std::mem::take(&mut self.workers))
     }

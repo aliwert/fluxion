@@ -81,6 +81,15 @@ impl Engine {
         self.workers.is_worker_thread(std::thread::current().id())
     }
 
+    /// Returns the identifiers of this engine's worker threads.
+    ///
+    /// Integration layers can retain these identifiers to reject operations
+    /// that would require a worker to join itself after the engine has been
+    /// moved out of shared binding state.
+    pub fn worker_thread_ids(&self) -> Vec<std::thread::ThreadId> {
+        self.workers.thread_ids()
+    }
+
     /// Submits a native Rust task and returns a handle to its result.
     ///
     /// The task starts executing once a worker is available. Every submitted

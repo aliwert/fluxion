@@ -1,29 +1,82 @@
+use std::process;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fluxion_core::{TaskError, TaskHandle, TaskStatus, TaskWaitOutcome};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyAnyMethods, PyFunction};
 
-use crate::error::{task_error, timeout_error};
+use crate::convert::{status_name, task_status};
+use crate::error::{forked_process_error, task_error, timeout_error};
 
 pub(crate) type PythonTaskResult = Result<Py<PyAny>, PyErr>;
 
-pub(crate) fn call_python_callable_then<F>(callable: Py<PyAny>, after: F) -> PythonTaskResult
-where
-    F: for<'py> FnOnce(Python<'py>, &PythonTaskResult),
-{
-    match Python::try_attach(move |py| {
-        let result = callable.call0(py);
-        drop(callable);
-        after(py, &result);
-        result
-    }) {
-        Some(result) => result,
-        None => Err(PyRuntimeError::new_err(
-            "Python interpreter is not available to execute callback",
-        )),
+/// Rejects coroutine functions and callables whose ``__call__`` is a coroutine
+/// function before a task is submitted to the engine.
+pub(crate) fn ensure_sync_callable(py: Python<'_>, callable: &Bound<'_, PyAny>) -> PyResult<()> {
+    if !callable.is_callable() {
+        return Err(PyTypeError::new_err(
+            "submit_async() requires a synchronous callable",
+        ));
     }
+
+    if let Ok(function) = callable.cast::<PyFunction>() {
+        let code = function.getattr("__code__")?;
+        let flags = code.getattr("co_flags")?.extract::<i32>()?;
+        if flags & (pyo3::ffi::CO_COROUTINE | pyo3::ffi::CO_ITERABLE_COROUTINE) != 0 {
+            return Err(coroutine_function_error());
+        }
+        return Ok(());
+    }
+
+    let inspect = py.import("inspect")?;
+    if inspect
+        .call_method1("iscoroutinefunction", (callable,))?
+        .extract::<bool>()?
+    {
+        return Err(coroutine_function_error());
+    }
+
+    if let Ok(call_method) = callable.getattr("__call__") {
+        if inspect
+            .call_method1("iscoroutinefunction", (call_method,))?
+            .extract::<bool>()?
+        {
+            return Err(coroutine_function_error());
+        }
+    }
+
+    Ok(())
+}
+
+/// Converts an awaitable callback result into a ``TypeError`` and closes a
+/// coroutine object so Python does not emit an unawaited-coroutine warning.
+pub(crate) fn reject_awaitable_result(py: Python<'_>, result: &Bound<'_, PyAny>) -> PyResult<()> {
+    let inspect = py.import("inspect")?;
+    if !inspect
+        .call_method1("isawaitable", (result,))?
+        .extract::<bool>()?
+    {
+        return Ok(());
+    }
+
+    if inspect
+        .call_method1("iscoroutine", (result,))?
+        .extract::<bool>()?
+    {
+        let _ = result.call_method0("close");
+    }
+
+    Err(PyTypeError::new_err(
+        "submit_async() requires a synchronous callable; the callable returned an awaitable. Use asyncio.create_task() for coroutine execution.",
+    ))
+}
+
+fn coroutine_function_error() -> PyErr {
+    PyTypeError::new_err(
+        "submit_async() requires a synchronous callable; coroutine functions are not supported. Use asyncio.create_task() for coroutine execution.",
+    )
 }
 
 /// Shared Python-level flag indicating that a callback raised.
@@ -71,21 +124,39 @@ enum HandleState {
 /// A handle may be waited on once. Dropping a handle does not cancel the task;
 /// the task still runs and its result is discarded. A timed-out wait does not
 /// consume the handle, so it can be waited on again.
-#[pyclass(name = "TaskHandle", module = "fluxion._core")]
+///
+/// Handles belong to the process that created their engine. Using a handle in
+/// a forked child raises :class:`fluxion.ForkedProcessError`.
+#[pyclass(name = "TaskHandle", module = "fluxion", generic)]
 pub(crate) struct PyTaskHandle {
     state: Mutex<HandleState>,
     callback_failure: CallbackFailure,
+    owner_pid: u32,
 }
 
 impl PyTaskHandle {
     pub(crate) fn new(
         handle: TaskHandle<PythonTaskResult>,
         callback_failure: CallbackFailure,
+        owner_pid: u32,
     ) -> Self {
         Self {
             state: Mutex::new(HandleState::Ready(handle)),
             callback_failure,
+            owner_pid,
         }
+    }
+
+    fn ensure_process(&self, py: Python<'_>) -> PyResult<()> {
+        if self.owner_pid == process::id() {
+            Ok(())
+        } else {
+            Err(forked_process_error(py))
+        }
+    }
+
+    fn is_forked(&self) -> bool {
+        self.owner_pid != process::id()
     }
 
     fn lock_state(&self) -> MutexGuard<'_, HandleState> {
@@ -147,20 +218,24 @@ impl PyTaskHandle {
     /// Blocks until the task completes and returns its Python result.
     ///
     /// With ``timeout=None`` the wait is indefinite. A finite timeout raises
-    /// ``concurrent.futures.TimeoutError`` only if the task has not completed
-    /// before the timeout elapses; it does not cancel the task or consume the
-    /// handle. Zero and negative timeouts use immediate-timeout semantics; NaN
-    /// and infinite values raise ``ValueError``.
+    /// :class:`fluxion.TaskTimeoutError`, which is also catchable as
+    /// ``TimeoutError`` and ``concurrent.futures.TimeoutError``. A timeout does
+    /// not cancel the task or consume the handle. Zero and negative timeouts
+    /// use immediate-timeout semantics; NaN and infinite values raise
+    /// ``ValueError``.
     ///
     /// The GIL is released while waiting so Python callbacks on Fluxion worker
     /// threads can make progress. If the callback raised an exception, that
     /// same exception is re-raised here. A task panic or disconnected worker
-    /// raises ``RuntimeError`` with distinct messages (``"task panicked"`` and
-    /// ``"task worker disconnected before producing a result"``). A cancelled
-    /// task raises ``concurrent.futures.CancelledError``. Calling ``wait``
-    /// after the result has already been consumed raises ``RuntimeError``.
+    /// raises :class:`fluxion.TaskPanicError` or
+    /// :class:`fluxion.WorkerDisconnectedError`, both also catchable as
+    /// ``RuntimeError``. A cancelled task raises
+    /// :class:`fluxion.TaskCancelledError`, also catchable as
+    /// ``concurrent.futures.CancelledError``. Calling ``wait`` after the result
+    /// has already been consumed raises ``RuntimeError``.
     #[pyo3(signature = (timeout=None))]
     fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
+        self.ensure_process(py)?;
         let timeout = parse_timeout(timeout)?;
         let handle = self.take_handle_for_wait()?;
 
@@ -195,30 +270,46 @@ impl PyTaskHandle {
     /// cancelled it. Running and terminal tasks cannot be interrupted. If
     /// another thread is currently waiting on this handle, ``cancel`` returns
     /// ``False`` because the handle is reserved by that wait.
-    fn cancel(&self) -> bool {
+    fn cancel(&self, py: Python<'_>) -> PyResult<bool> {
+        self.ensure_process(py)?;
         match &mut *self.lock_state() {
-            HandleState::Ready(handle) => handle.cancel(),
-            HandleState::Waiting(_) | HandleState::Consumed(_) => false,
+            HandleState::Ready(handle) => Ok(handle.cancel()),
+            HandleState::Waiting(_) | HandleState::Consumed(_) => Ok(false),
         }
     }
 
     /// Returns whether the task has reached a terminal state.
-    fn done(&self) -> bool {
-        self.lifecycle_status().is_terminal()
+    fn done(&self, py: Python<'_>) -> PyResult<bool> {
+        self.ensure_process(py)?;
+        Ok(self.lifecycle_status().is_terminal())
     }
 
     /// Returns whether the task was cancelled before it started.
-    fn cancelled(&self) -> bool {
-        self.lifecycle_status() == TaskStatus::Cancelled
+    fn cancelled(&self, py: Python<'_>) -> PyResult<bool> {
+        self.ensure_process(py)?;
+        Ok(self.lifecycle_status() == TaskStatus::Cancelled)
     }
 
     /// Current lifecycle status.
     ///
-    /// Values are stable lowercase strings: ``"queued"``, ``"running"``,
+    /// The value is a :class:`fluxion.TaskStatus` member. It also compares
+    /// equal to the stable lowercase strings ``"queued"``, ``"running"``,
     /// ``"completed"``, ``"failed"``, and ``"cancelled"``.
     #[getter]
-    fn status(&self) -> &'static str {
-        status_name(self.lifecycle_status())
+    fn status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.ensure_process(py)?;
+        task_status(py, self.lifecycle_status())
+    }
+
+    fn __repr__(&self) -> String {
+        if self.is_forked() {
+            "TaskHandle(status='forked-process')".to_string()
+        } else {
+            format!(
+                "TaskHandle(status='{}')",
+                status_name(self.lifecycle_status())
+            )
+        }
     }
 }
 
@@ -240,14 +331,4 @@ fn parse_timeout(timeout: Option<f64>) -> PyResult<Option<Duration>> {
     Duration::try_from_secs_f64(seconds)
         .map(Some)
         .map_err(|_| PyValueError::new_err("timeout is out of range"))
-}
-
-fn status_name(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Queued => "queued",
-        TaskStatus::Running => "running",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Cancelled => "cancelled",
-    }
 }

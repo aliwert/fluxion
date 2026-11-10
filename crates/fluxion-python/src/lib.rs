@@ -11,6 +11,7 @@
 //! the core task's queued-only cancellation mechanism.
 
 mod asyncio;
+mod convert;
 mod engine;
 mod error;
 mod task;
