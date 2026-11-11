@@ -7,11 +7,13 @@ not execute in parallel. The Rust core can execute native workloads in
 parallel, but this binding currently exposes Python callbacks only.
 
 Task handles expose lifecycle information and support cancellation before a
-task starts. ``wait`` blocks until a result is available, optionally with a
-timeout, and re-raises exceptions from the callback. A handle may be waited on
-once; a timed-out wait does not consume the handle, so it can be waited on
-again. ``status`` is a :class:`TaskStatus` member, which also compares equal to
-the corresponding lowercase string for compatibility with earlier releases.
+task starts. ``wait`` and ``result`` block until a result is available,
+optionally with a timeout, and re-raise exceptions from the callback.
+``exception`` returns the stored exception without raising it. Handles may be
+waited on repeatedly and from multiple threads; a timed-out wait does not
+consume the handle. ``status`` is a :class:`TaskStatus` member, which also
+compares equal to the corresponding lowercase string for compatibility with
+earlier releases.
 
 ``Engine.close`` is idempotent and drains accepted tasks. ``Engine.shutdown``
 is a backward-compatible alias for ``close``. Both block until worker threads

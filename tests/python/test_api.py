@@ -148,15 +148,193 @@ def test_multiple_handles_can_be_waited_out_of_order():
         engine.shutdown()
 
 
-def test_wait_can_only_be_called_once():
+def test_wait_and_result_are_repeatable():
     engine = Engine(worker_count=1, queue_capacity=4)
     try:
-        handle = engine.submit(lambda: 1)
+        handle = engine.submit(lambda: [1, 2, 3])
 
-        assert handle.wait() == 1
-        with pytest.raises(RuntimeError, match="already been consumed"):
-            handle.wait()
+        first = handle.wait()
+        assert handle.result() is first
+        assert handle.wait() is first
+        assert first == [1, 2, 3]
     finally:
+        engine.shutdown()
+
+
+def test_multiple_waiters_share_the_same_result():
+    engine = Engine(worker_count=2, queue_capacity=16)
+    started = threading.Event()
+    release = threading.Event()
+    barrier = threading.Barrier(5)
+    sentinel = object()
+    results = []
+    errors = []
+
+    def task():
+        started.set()
+        assert release.wait(5)
+        return sentinel
+
+    def waiter():
+        barrier.wait()
+        try:
+            results.append(handle.result(timeout=5))
+        except BaseException as error:  # pragma: no cover - assertion helper
+            errors.append(error)
+
+    try:
+        handle = engine.submit(task)
+        workers = [threading.Thread(target=waiter) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+
+        assert started.wait(5)
+        barrier.wait()
+        release.set()
+
+        for worker in workers:
+            worker.join(5)
+            assert not worker.is_alive()
+
+        assert errors == []
+        assert len(results) == 4
+        assert all(result is sentinel for result in results)
+        assert handle.exception() is None
+        assert handle.result() is sentinel
+        assert handle.done()
+        assert not handle.running()
+    finally:
+        release.set()
+        engine.shutdown()
+
+
+def test_exception_returns_stored_callback_exception():
+    class CallbackError(Exception):
+        pass
+
+    engine = Engine(worker_count=1, queue_capacity=4)
+    error = CallbackError("callback failed")
+    try:
+        handle = engine.submit(lambda: (_ for _ in ()).throw(error))
+
+        with pytest.raises(CallbackError, match="callback failed") as caught:
+            handle.result()
+        assert caught.value is error
+
+        assert handle.exception() is error
+        assert handle.exception() is error
+        with pytest.raises(CallbackError) as caught:
+            handle.wait()
+        assert caught.value is error
+    finally:
+        engine.shutdown()
+
+
+def test_exception_and_result_share_cancelled_error_identity():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocker():
+        started.set()
+        assert release.wait(5)
+        return None
+
+    try:
+        first = engine.submit(blocker)
+        assert started.wait(5)
+        target = engine.submit(lambda: None)
+        assert target.cancel()
+
+        exception = target.exception()
+        assert isinstance(exception, TaskCancelledError)
+        assert target.exception() is exception
+        with pytest.raises(TaskCancelledError) as caught:
+            target.result()
+        assert caught.value is exception
+    finally:
+        release.set()
+        assert first.wait(5) is None
+        engine.shutdown()
+
+
+def test_cancel_while_another_thread_waits():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    waiter_done = threading.Event()
+    errors = []
+
+    def blocker():
+        blocker_started.set()
+        assert release_blocker.wait(5)
+        return None
+
+    def waiter():
+        try:
+            target.result(timeout=5)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            waiter_done.set()
+
+    try:
+        blocker_handle = engine.submit(blocker)
+        assert blocker_started.wait(5)
+        target = engine.submit(lambda: None)
+
+        worker = threading.Thread(target=waiter)
+        worker.start()
+        time.sleep(0.05)
+        assert target.cancel()
+        assert waiter_done.wait(5)
+        worker.join(5)
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], TaskCancelledError)
+    finally:
+        release_blocker.set()
+        assert blocker_handle.wait(5) is None
+        engine.shutdown()
+
+
+def test_done_implies_result_is_immediately_available():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    try:
+        for value in range(100):
+            handle = engine.submit(lambda value=value: value)
+            deadline = time.monotonic() + 5
+            while not handle.done() and time.monotonic() < deadline:
+                time.sleep(0.0001)
+            assert handle.done()
+            assert handle.result(timeout=0) == value
+            assert handle.exception(timeout=0) is None
+    finally:
+        engine.shutdown()
+
+
+def test_running_reflects_lifecycle():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+
+    def task():
+        started.set()
+        assert release.wait(5)
+        return "done"
+
+    try:
+        handle = engine.submit(task)
+        assert started.wait(5)
+        assert handle.running()
+        assert not handle.done()
+
+        release.set()
+        assert handle.result() == "done"
+        assert not handle.running()
+        assert handle.done()
+    finally:
+        release.set()
         engine.shutdown()
 
 
