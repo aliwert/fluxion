@@ -2,7 +2,7 @@ use std::process;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use fluxion_core::{TaskError, TaskHandle, TaskStatus, TaskWaitOutcome};
+use fluxion_core::{SharedTaskHandle, TaskError, TaskHandle, TaskStatus};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyFunction};
@@ -113,25 +113,27 @@ fn lock_flag(flag: &Mutex<bool>) -> MutexGuard<'_, bool> {
     }
 }
 
-enum HandleState {
-    Ready(TaskHandle<PythonTaskResult>),
-    Waiting(TaskStatus),
-    Consumed(TaskStatus),
+/// Python-visible task outcome extracted while the core result lock is held.
+enum PyOutcome {
+    Value(Py<PyAny>),
+    CallbackError(PyErr),
+    CoreError(TaskError),
 }
 
 /// Handle to a task submitted to a Fluxion engine.
 ///
-/// A handle may be waited on once. Dropping a handle does not cancel the task;
-/// the task still runs and its result is discarded. A timed-out wait does not
-/// consume the handle, so it can be waited on again.
+/// A handle supports repeatable result access, including concurrent waits from
+/// multiple Python threads. Dropping a handle does not cancel the task; the
+/// task still runs and its result is discarded when the last handle is dropped.
 ///
 /// Handles belong to the process that created their engine. Using a handle in
 /// a forked child raises :class:`fluxion.ForkedProcessError`.
 #[pyclass(name = "TaskHandle", module = "fluxion", generic)]
 pub(crate) struct PyTaskHandle {
-    state: Mutex<HandleState>,
+    handle: SharedTaskHandle<PythonTaskResult>,
     callback_failure: CallbackFailure,
     owner_pid: u32,
+    mapped_failure: Mutex<Option<PyErr>>,
 }
 
 impl PyTaskHandle {
@@ -141,9 +143,10 @@ impl PyTaskHandle {
         owner_pid: u32,
     ) -> Self {
         Self {
-            state: Mutex::new(HandleState::Ready(handle)),
+            handle: handle.into_shared(),
             callback_failure,
             owner_pid,
+            mapped_failure: Mutex::new(None),
         }
     }
 
@@ -159,51 +162,15 @@ impl PyTaskHandle {
         self.owner_pid != process::id()
     }
 
-    fn lock_state(&self) -> MutexGuard<'_, HandleState> {
-        match self.state.lock() {
+    fn lock_mapped_failure(&self) -> MutexGuard<'_, Option<PyErr>> {
+        match self.mapped_failure.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
-    fn take_handle_for_wait(&self) -> PyResult<TaskHandle<PythonTaskResult>> {
-        let mut state = self.lock_state();
-        let snapshot = match &*state {
-            HandleState::Ready(handle) => handle.status(),
-            HandleState::Waiting(_) => {
-                return Err(PyRuntimeError::new_err(
-                    "task handle cannot be waited on while another wait is in progress",
-                ));
-            }
-            HandleState::Consumed(_) => {
-                return Err(PyRuntimeError::new_err(
-                    "task handle has already been consumed",
-                ));
-            }
-        };
-
-        let previous = std::mem::replace(&mut *state, HandleState::Waiting(snapshot));
-        match previous {
-            HandleState::Ready(handle) => Ok(handle),
-            _ => unreachable!("handle state was checked above"),
-        }
-    }
-
-    fn restore_after_timeout(&self, handle: TaskHandle<PythonTaskResult>) {
-        let mut state = self.lock_state();
-        debug_assert!(matches!(*state, HandleState::Waiting(_)));
-        *state = HandleState::Ready(handle);
-    }
-
-    fn mark_consumed(&self, status: TaskStatus) {
-        *self.lock_state() = HandleState::Consumed(status);
-    }
-
     fn lifecycle_status(&self) -> TaskStatus {
-        let core_status = match &*self.lock_state() {
-            HandleState::Ready(handle) => handle.status(),
-            HandleState::Waiting(status) | HandleState::Consumed(status) => *status,
-        };
+        let core_status = self.handle.status();
 
         if core_status == TaskStatus::Completed && self.callback_failure.load() {
             TaskStatus::Failed
@@ -211,10 +178,66 @@ impl PyTaskHandle {
             core_status
         }
     }
+
+    fn wait_result(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
+        self.ensure_process(py)?;
+        let timeout = parse_timeout(timeout)?;
+        let ready = py.detach(|| self.handle.wait_until_ready(timeout));
+
+        if !ready {
+            return Err(timeout_error(py));
+        }
+
+        match self.outcome(py)? {
+            PyOutcome::Value(value) => Ok(value),
+            PyOutcome::CallbackError(error) => Err(error),
+            PyOutcome::CoreError(error) => Err(self.mapped_failure(py, error)),
+        }
+    }
+
+    fn outcome(&self, py: Python<'_>) -> PyResult<PyOutcome> {
+        let Some(view) = self.handle.result_view() else {
+            return Err(PyRuntimeError::new_err(
+                "task result is not published after the task was reported done",
+            ));
+        };
+
+        let outcome = match &*view {
+            Ok(Ok(value)) => PyOutcome::Value(value.clone_ref(py)),
+            Ok(Err(error)) => PyOutcome::CallbackError(error.clone_ref(py)),
+            Err(error) => PyOutcome::CoreError(error.clone()),
+        };
+
+        Ok(outcome)
+    }
+
+    fn mapped_failure(&self, py: Python<'_>, error: TaskError) -> PyErr {
+        if let Some(error) = self.lock_mapped_failure().as_ref() {
+            return error.clone_ref(py);
+        }
+
+        let mapped = task_error(py, error);
+        let mut cached = self.lock_mapped_failure();
+
+        if let Some(error) = cached.as_ref() {
+            return error.clone_ref(py);
+        }
+
+        *cached = Some(mapped.clone_ref(py));
+        mapped
+    }
 }
 
 #[pymethods]
 impl PyTaskHandle {
+    /// Blocks until the task completes and returns its Python result.
+    ///
+    /// This is a repeatable alias of :meth:`result`.
+    #[pyo3(signature = (timeout=None))]
+    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
+        self.wait_result(py, timeout)
+    }
+
     /// Blocks until the task completes and returns its Python result.
     ///
     /// With ``timeout=None`` the wait is indefinite. A finite timeout raises
@@ -231,70 +254,74 @@ impl PyTaskHandle {
     /// :class:`fluxion.WorkerDisconnectedError`, both also catchable as
     /// ``RuntimeError``. A cancelled task raises
     /// :class:`fluxion.TaskCancelledError`, also catchable as
-    /// ``concurrent.futures.CancelledError``. Calling ``wait`` after the result
-    /// has already been consumed raises ``RuntimeError``.
+    /// ``concurrent.futures.CancelledError``.
+    ///
+    /// This method may be called multiple times and from multiple threads.
     #[pyo3(signature = (timeout=None))]
-    fn wait(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
+    fn result(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
+        self.wait_result(py, timeout)
+    }
+
+    /// Blocks until the task completes and returns its exception, if any.
+    ///
+    /// Returns ``None`` on success. For failed tasks, returns the stored
+    /// exception object without raising it. For cancelled tasks, returns a
+    /// :class:`fluxion.TaskCancelledError`. A timeout raises
+    /// :class:`fluxion.TaskTimeoutError`; it does not cancel the task.
+    #[pyo3(signature = (timeout=None))]
+    fn exception(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
         self.ensure_process(py)?;
         let timeout = parse_timeout(timeout)?;
-        let handle = self.take_handle_for_wait()?;
+        let ready = py.detach(|| self.handle.wait_until_ready(timeout));
 
-        let outcome = match timeout {
-            None => py.detach(move || handle.wait()),
-            Some(timeout) => match py.detach(move || handle.wait_timeout(timeout)) {
-                TaskWaitOutcome::Completed(result) => result,
-                TaskWaitOutcome::TimedOut(handle) => {
-                    self.restore_after_timeout(handle);
-                    return Err(timeout_error(py));
-                }
-            },
-        };
-
-        let status = match &outcome {
-            Ok(Ok(_)) if !self.callback_failure.load() => TaskStatus::Completed,
-            Ok(Ok(_)) | Ok(Err(_)) => TaskStatus::Failed,
-            Err(TaskError::Cancelled) => TaskStatus::Cancelled,
-            Err(_) => TaskStatus::Failed,
-        };
-        self.mark_consumed(status);
-
-        match outcome {
-            Ok(result) => result,
-            Err(error) => Err(task_error(py, error)),
+        if !ready {
+            return Err(timeout_error(py));
         }
+
+        let exception = match self.outcome(py)? {
+            PyOutcome::Value(_) => return Ok(py.None()),
+            PyOutcome::CallbackError(error) => error.into_value(py).into_any(),
+            PyOutcome::CoreError(error) => self.mapped_failure(py, error).into_value(py).into_any(),
+        };
+
+        Ok(exception)
     }
 
     /// Attempts to cancel the task before it starts running.
     ///
     /// Returns ``True`` only when the task was still queued and this call
-    /// cancelled it. Running and terminal tasks cannot be interrupted. If
-    /// another thread is currently waiting on this handle, ``cancel`` returns
-    /// ``False`` because the handle is reserved by that wait.
+    /// cancelled it. Running and terminal tasks cannot be interrupted.
+    /// Cancellation works independently of pending waiters.
     fn cancel(&self, py: Python<'_>) -> PyResult<bool> {
         self.ensure_process(py)?;
-        match &mut *self.lock_state() {
-            HandleState::Ready(handle) => Ok(handle.cancel()),
-            HandleState::Waiting(_) | HandleState::Consumed(_) => Ok(false),
-        }
+        Ok(self.handle.cancel())
     }
 
-    /// Returns whether the task has reached a terminal state.
+    /// Returns whether the task outcome has been fully published.
     fn done(&self, py: Python<'_>) -> PyResult<bool> {
         self.ensure_process(py)?;
-        Ok(self.lifecycle_status().is_terminal())
+        Ok(self.handle.done())
     }
 
     /// Returns whether the task was cancelled before it started.
     fn cancelled(&self, py: Python<'_>) -> PyResult<bool> {
         self.ensure_process(py)?;
-        Ok(self.lifecycle_status() == TaskStatus::Cancelled)
+        Ok(self.handle.cancelled())
+    }
+
+    /// Returns whether the task is currently running.
+    fn running(&self, py: Python<'_>) -> PyResult<bool> {
+        self.ensure_process(py)?;
+        Ok(self.handle.status() == TaskStatus::Running)
     }
 
     /// Current lifecycle status.
     ///
     /// The value is a :class:`fluxion.TaskStatus` member. It also compares
     /// equal to the stable lowercase strings ``"queued"``, ``"running"``,
-    /// ``"completed"``, ``"failed"``, and ``"cancelled"``.
+    /// ``"completed"``, ``"failed"``, and ``"cancelled"``. A terminal status
+    /// may be observed slightly before ``done()`` becomes true; use ``done()``
+    /// or ``result(timeout=0)`` to determine whether the outcome is available.
     #[getter]
     fn status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.ensure_process(py)?;

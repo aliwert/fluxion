@@ -1,8 +1,7 @@
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{self, Thread};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -46,7 +45,7 @@ impl TaskStatus {
 }
 
 /// Errors produced while waiting for a submitted task.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum TaskError {
     /// The task panicked while it was running.
     #[error("task panicked")]
@@ -91,19 +90,33 @@ impl<T> TaskHandle<T> {
         self.control.try_cancel()
     }
 
-    /// Returns whether the task has reached a terminal state.
+    /// Returns whether the task outcome has been fully published.
     pub fn done(&self) -> bool {
-        self.control.status().is_terminal()
+        self.control.done()
     }
 
-    /// Returns whether the task was cancelled.
+    /// Returns whether the task was cancelled and its outcome published.
     pub fn cancelled(&self) -> bool {
-        self.control.status() == TaskStatus::Cancelled
+        self.control.cancelled()
     }
 
     /// Returns the current task lifecycle state.
+    ///
+    /// A terminal status may be observed slightly before [`TaskHandle::done`]
+    /// becomes true. Use `done` to determine whether the result is available.
     pub fn status(&self) -> TaskStatus {
         self.control.status()
+    }
+
+    /// Converts this handle into a cloneable handle for repeated result access.
+    ///
+    /// This consumes the one-shot handle. The task result is retained until
+    /// all shared handles are dropped; unlike [`TaskHandle::wait`], shared
+    /// handles never remove the stored result.
+    pub fn into_shared(self) -> SharedTaskHandle<T> {
+        SharedTaskHandle {
+            control: self.control,
+        }
     }
 
     /// Blocks until the task completes and returns its result.
@@ -136,29 +149,171 @@ impl<T> fmt::Debug for TaskHandle<T> {
     }
 }
 
+/// Cloneable handle for repeated result access and multiple waiters.
+///
+/// Create one with [`TaskHandle::into_shared`]. The result remains available
+/// for every shared handle until the last handle and result view are dropped.
+pub struct SharedTaskHandle<T> {
+    control: Arc<TaskControl<T>>,
+}
+
+impl<T> Clone for SharedTaskHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            control: Arc::clone(&self.control),
+        }
+    }
+}
+
+impl<T> SharedTaskHandle<T> {
+    /// Attempts to cancel the task before it starts running.
+    pub fn cancel(&self) -> bool {
+        self.control.try_cancel()
+    }
+
+    /// Returns whether the task outcome has been fully published.
+    pub fn done(&self) -> bool {
+        self.control.done()
+    }
+
+    /// Returns whether the task was cancelled and its outcome published.
+    pub fn cancelled(&self) -> bool {
+        self.control.cancelled()
+    }
+
+    /// Returns the current task lifecycle state.
+    ///
+    /// A terminal status may be observed slightly before [`Self::done`] becomes
+    /// true. Use `done` or a result view to determine whether the result is
+    /// available.
+    pub fn status(&self) -> TaskStatus {
+        self.control.status()
+    }
+
+    /// Waits indefinitely and returns a result view.
+    ///
+    /// The view holds the result lock for its lifetime. Inspect it through
+    /// [`Deref`], then drop it to release the lock.
+    pub fn wait_shared(&self) -> TaskResult<'_, T> {
+        self.wait_until_ready(None);
+        self.result_view()
+            .expect("shared task result must be published after waiting")
+    }
+
+    /// Waits up to `timeout` and returns a result view if the outcome is ready.
+    pub fn wait_shared_timeout(&self, timeout: Duration) -> Option<TaskResult<'_, T>> {
+        if !self.wait_until_ready(Some(timeout)) {
+            return None;
+        }
+
+        self.result_view()
+    }
+
+    /// Waits until the outcome is published without acquiring the result lock.
+    ///
+    /// This is useful for bindings that must release a foreign runtime lock
+    /// while waiting and acquire the result only after re-entering the runtime.
+    /// A `None` timeout waits indefinitely.
+    pub fn wait_until_ready(&self, timeout: Option<Duration>) -> bool {
+        self.control.wait_until_ready(timeout)
+    }
+
+    /// Acquires a published result view without waiting.
+    ///
+    /// Returns `None` if the outcome has not been published yet.
+    pub fn result_view(&self) -> Option<TaskResult<'_, T>> {
+        let guard = self.control.lock_slot();
+
+        if guard.result.is_some() {
+            Some(TaskResult { guard })
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> fmt::Debug for SharedTaskHandle<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SharedTaskHandle")
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque view of a published task result.
+///
+/// The internal guard is intentionally not exposed. Inspect the result through
+/// `Deref` without requiring `T: Clone` or `T: Sync`.
+pub struct TaskResult<'a, T> {
+    guard: MutexGuard<'a, TaskSlot<T>>,
+}
+
+impl<T> std::ops::Deref for TaskResult<'_, T> {
+    type Target = Result<T, TaskError>;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .result
+            .as_ref()
+            .expect("task result view must contain a published result")
+    }
+}
+
+impl<T> TaskResult<'_, T> {
+    /// Returns the published result by reference.
+    pub fn as_result(&self) -> Result<&T, &TaskError> {
+        self.guard
+            .result
+            .as_ref()
+            .expect("task result view must contain a published result")
+            .as_ref()
+    }
+}
+
+impl<T> fmt::Debug for TaskResult<'_, T>
+where
+    T: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TaskResult")
+            .field("result", &self.as_result())
+            .finish_non_exhaustive()
+    }
+}
+
 struct TaskSlot<T> {
     result: Option<Result<T, TaskError>>,
-    waiter: Option<Thread>,
 }
 
 struct TaskControl<T> {
     status: AtomicU8,
+    published: AtomicBool,
     slot: Mutex<TaskSlot<T>>,
+    ready: Condvar,
 }
 
 impl<T> TaskControl<T> {
     fn new() -> Self {
         Self {
             status: AtomicU8::new(TaskStatus::Queued.as_u8()),
-            slot: Mutex::new(TaskSlot {
-                result: None,
-                waiter: None,
-            }),
+            published: AtomicBool::new(false),
+            slot: Mutex::new(TaskSlot { result: None }),
+            ready: Condvar::new(),
         }
     }
 
     fn status(&self) -> TaskStatus {
-        TaskStatus::from_u8(self.status.load(Ordering::Relaxed))
+        TaskStatus::from_u8(self.status.load(Ordering::Acquire))
+    }
+
+    fn done(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.done() && self.status() == TaskStatus::Cancelled
     }
 
     fn try_start(&self) -> bool {
@@ -166,8 +321,8 @@ impl<T> TaskControl<T> {
             .compare_exchange(
                 TaskStatus::Queued.as_u8(),
                 TaskStatus::Running.as_u8(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             )
             .is_ok()
     }
@@ -178,15 +333,15 @@ impl<T> TaskControl<T> {
             .compare_exchange(
                 TaskStatus::Queued.as_u8(),
                 TaskStatus::Cancelled.as_u8(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             )
             .is_err()
         {
             return false;
         }
 
-        self.publish(Err(TaskError::Cancelled));
+        self.publish(Err(TaskError::Cancelled), TaskStatus::Cancelled);
         true
     }
 
@@ -195,8 +350,7 @@ impl<T> TaskControl<T> {
             Ok(_) => TaskStatus::Completed,
             Err(_) => TaskStatus::Failed,
         };
-        self.status.store(status.as_u8(), Ordering::Relaxed);
-        self.publish(result);
+        self.publish(result, status);
     }
 
     fn abandon(&self) {
@@ -213,76 +367,104 @@ impl<T> TaskControl<T> {
                 .compare_exchange(
                     expected,
                     TaskStatus::Failed.as_u8(),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 )
                 .is_ok()
             {
-                self.publish(Err(TaskError::WorkerDisconnected));
+                self.publish(Err(TaskError::WorkerDisconnected), TaskStatus::Failed);
                 return;
             }
         }
     }
 
-    fn publish(&self, result: Result<T, TaskError>) {
-        let waiter = {
+    fn publish(&self, result: Result<T, TaskError>, terminal: TaskStatus) {
+        {
             let mut slot = self.lock_slot();
+            debug_assert!(slot.result.is_none());
             slot.result = Some(result);
-            slot.waiter.take()
-        };
-
-        if let Some(waiter) = waiter {
-            waiter.unpark();
+            self.status.store(terminal.as_u8(), Ordering::Release);
+            self.published.store(true, Ordering::Release);
         }
+
+        self.ready.notify_all();
     }
 
     fn wait_result(&self) -> Result<T, TaskError> {
-        let current = thread::current();
         let mut slot = self.lock_slot();
 
         loop {
             if let Some(result) = slot.result.take() {
-                slot.waiter = None;
                 return result;
             }
 
-            slot.waiter = Some(current.clone());
-            drop(slot);
-            thread::park();
-            slot = self.lock_slot();
+            slot = self.wait_on_ready(slot);
         }
     }
 
     fn wait_result_timeout(&self, timeout: Duration) -> Option<Result<T, TaskError>> {
         let deadline = Instant::now().checked_add(timeout);
-        let current = thread::current();
         let mut slot = self.lock_slot();
 
         loop {
             if let Some(result) = slot.result.take() {
-                slot.waiter = None;
                 return Some(result);
             }
 
             let Some(deadline) = deadline else {
-                slot.waiter = Some(current.clone());
-                drop(slot);
-                thread::park();
-                slot = self.lock_slot();
+                slot = self.wait_on_ready(slot);
                 continue;
             };
 
             let now = Instant::now();
 
             if now >= deadline {
-                slot.waiter = None;
                 return None;
             }
 
-            slot.waiter = Some(current.clone());
-            drop(slot);
-            thread::park_timeout(deadline - now);
-            slot = self.lock_slot();
+            slot = self.wait_on_ready_timeout(slot, deadline - now);
+        }
+    }
+
+    fn wait_until_ready(&self, timeout: Option<Duration>) -> bool {
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        let mut slot = self.lock_slot();
+
+        loop {
+            if slot.result.is_some() {
+                return true;
+            }
+
+            let Some(deadline) = deadline else {
+                slot = self.wait_on_ready(slot);
+                continue;
+            };
+
+            let now = Instant::now();
+
+            if now >= deadline {
+                return false;
+            }
+
+            slot = self.wait_on_ready_timeout(slot, deadline - now);
+        }
+    }
+
+    fn wait_on_ready<'a>(&self, slot: MutexGuard<'a, TaskSlot<T>>) -> MutexGuard<'a, TaskSlot<T>> {
+        match self.ready.wait(slot) {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn wait_on_ready_timeout<'a>(
+        &self,
+        slot: MutexGuard<'a, TaskSlot<T>>,
+        timeout: Duration,
+    ) -> MutexGuard<'a, TaskSlot<T>> {
+        match self.ready.wait_timeout(slot, timeout) {
+            Ok((guard, _)) => guard,
+            Err(poisoned) => poisoned.into_inner().0,
         }
     }
 
@@ -502,5 +684,128 @@ mod tests {
 
         assert_eq!(executions.load(Ordering::SeqCst), 0);
         assert_eq!(handle.wait(), Err(TaskError::Cancelled));
+    }
+
+    #[test]
+    fn shared_handle_publishes_abandonment_outcome() {
+        let (handle, task) = prepare_task(|| 1);
+        let shared = handle.into_shared();
+
+        drop(task);
+
+        assert!(shared.done());
+        assert_eq!(shared.status(), TaskStatus::Failed);
+        assert_eq!(
+            shared.wait_shared().as_result(),
+            Err(&TaskError::WorkerDisconnected)
+        );
+    }
+
+    #[test]
+    fn shared_handle_supports_multiple_waiters() {
+        let (handle, task) = prepare_task(|| 42);
+        let shared = handle.into_shared();
+        let mut waiters = Vec::new();
+
+        for _ in 0..4 {
+            let waiter = shared.clone();
+            waiters.push(thread::spawn(move || {
+                let result = waiter
+                    .wait_shared_timeout(TEST_TIMEOUT)
+                    .expect("shared result should be published");
+                assert_eq!(result.as_result(), Ok(&42));
+            }));
+        }
+
+        task();
+
+        for waiter in waiters {
+            waiter.join().expect("waiter should not panic");
+        }
+
+        assert_eq!(shared.wait_shared().as_result(), Ok(&42));
+    }
+
+    #[test]
+    fn shared_timeout_preserves_result_for_later_access() {
+        let (handle, task) = prepare_task(|| 11);
+        let shared = handle.into_shared();
+
+        assert!(shared.result_view().is_none());
+        assert!(
+            shared
+                .wait_shared_timeout(Duration::from_millis(10))
+                .is_none()
+        );
+
+        task();
+
+        assert_eq!(shared.wait_shared().as_result(), Ok(&11));
+        assert_eq!(shared.wait_shared().as_result(), Ok(&11));
+    }
+
+    #[test]
+    fn shared_result_does_not_require_clone_or_sync() {
+        struct NotClone(u32);
+
+        let (handle, task) = prepare_task(|| NotClone(7));
+        let shared = handle.into_shared();
+        task();
+
+        let result = shared.wait_shared();
+        assert_eq!(result.as_result().map(|value| value.0), Ok(7));
+    }
+
+    #[test]
+    fn shared_cancel_wakes_and_completes_pending_waiters() {
+        let (handle, task) = prepare_task(|| 3);
+        let shared = handle.into_shared();
+        let mut waiters = Vec::new();
+
+        for _ in 0..3 {
+            let waiter = shared.clone();
+            waiters.push(thread::spawn(move || {
+                let result = waiter
+                    .wait_shared_timeout(TEST_TIMEOUT)
+                    .expect("cancellation should publish a result");
+                assert_eq!(result.as_result(), Err(&TaskError::Cancelled));
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(10));
+        assert!(shared.cancel());
+        assert!(shared.cancelled());
+
+        for waiter in waiters {
+            waiter.join().expect("waiter should not panic");
+        }
+
+        drop(task);
+    }
+
+    #[test]
+    fn done_is_never_observed_before_the_result_is_available() {
+        for value in 0..100 {
+            let (handle, task) = prepare_task(move || value);
+            let reader = handle.into_shared();
+            let poller = {
+                let reader = reader.clone();
+                thread::spawn(move || {
+                    loop {
+                        if reader.done() {
+                            let result = reader
+                                .result_view()
+                                .expect("done must imply a published result");
+                            assert_eq!(result.as_result(), Ok(&value));
+                            return;
+                        }
+                        thread::yield_now();
+                    }
+                })
+            };
+
+            task();
+            poller.join().expect("poller should not panic");
+        }
     }
 }
