@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
-from typing import Any, Callable, Coroutine, Generic, TypeVar, final
+from typing import Any, Callable, Coroutine, Generic, ParamSpec, TypeVar, final
 
 from .errors import (
     EngineClosedError as EngineClosedError,
@@ -20,6 +20,7 @@ from .status import EngineState as EngineState, TaskStatus as TaskStatus
 
 __version__: str
 
+_P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 @final
@@ -37,8 +38,18 @@ class Engine:
     def state(self) -> EngineState: ...
     @property
     def closed(self) -> bool: ...
-    def submit(self, callable: Callable[[], _T]) -> TaskHandle[_T]: ...
-    def submit_async(self, callable: Callable[[], _T]) -> asyncio.Future[_T]: ...
+    def submit(
+        self,
+        callable: Callable[_P, _T],
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> TaskHandle[_T]: ...
+    def submit_async(
+        self,
+        callable: Callable[_P, _T],
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> asyncio.Future[_T]: ...
     def close(self) -> None: ...
     def shutdown(self) -> None: ...
     def _ensure_async_close_allowed(self) -> None: ...

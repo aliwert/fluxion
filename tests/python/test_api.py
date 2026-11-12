@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import functools
 import gc
 import inspect
 import os
@@ -9,6 +10,7 @@ import textwrap
 import threading
 import time
 import warnings
+import weakref
 from importlib.metadata import version
 from importlib.resources import files
 
@@ -1374,6 +1376,353 @@ def test_engine_context_manager_preserves_block_exception_after_duplicate_close(
 
     assert engine.closed
     assert engine.state is EngineState.CLOSED
+
+
+def test_submit_forwards_positional_arguments():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    try:
+        assert engine.submit(pow, 2, 3).wait() == 8
+        assert engine.submit(lambda left, right: left + right, 4, 5).wait() == 9
+        assert engine.submit(lambda: 42).wait() == 42
+        assert engine.submit(lambda value=3: value * 2, value=4).wait() == 8
+    finally:
+        engine.close()
+
+
+def test_submit_forwards_keyword_only_and_mixed_arguments():
+    def describe(prefix, value, *, suffix="", repeat=1):
+        return (prefix + value + suffix) * repeat
+
+    engine = Engine(worker_count=1, queue_capacity=8)
+    try:
+        empty_kwargs: dict[str, object] = {}
+        assert engine.submit(describe, "a", "b").wait() == "ab"
+        assert engine.submit(describe, "a", "b", suffix="c").wait() == "abc"
+        assert engine.submit(describe, "a", "b", repeat=2).wait() == "abab"
+        assert engine.submit(describe, "a", "b", **empty_kwargs).wait() == "ab"
+    finally:
+        engine.close()
+
+
+def test_submit_supports_bound_methods_callable_objects_and_partial():
+    class Calculator:
+        def __init__(self, base):
+            self.base = base
+
+        def scale(self, value, *, factor=1):
+            return (value + self.base) * factor
+
+        def __call__(self, value, *, factor=1):
+            return (value - self.base) * factor
+
+    def combine(left, right, *, extra=0):
+        return left + right + extra
+
+    calculator = Calculator(3)
+    engine = Engine(worker_count=1, queue_capacity=8)
+    try:
+        assert engine.submit(calculator.scale, 4, factor=2).wait() == 14
+        assert engine.submit(calculator, 10, factor=2).wait() == 14
+        assert engine.submit(functools.partial(combine, 2, extra=5), 7).wait() == 14
+        assert engine.submit(callable=lambda: 21).wait() == 21
+    finally:
+        engine.close()
+
+
+def test_submit_argument_binding_errors_are_task_failures():
+    def takes_one(value):
+        return value
+
+    engine = Engine(worker_count=1, queue_capacity=8)
+    try:
+        too_many = engine.submit(takes_one, 1, 2)
+        with pytest.raises(TypeError):
+            too_many.wait()
+        assert isinstance(too_many.exception(), TypeError)
+        assert too_many.status == "failed"
+
+        unexpected = engine.submit(takes_one, 1, unexpected=True)
+        with pytest.raises(TypeError):
+            unexpected.wait()
+        assert unexpected.status == "failed"
+    finally:
+        engine.close()
+
+
+def test_submit_with_arguments_preserves_callback_exception_identity():
+    class CallbackError(Exception):
+        pass
+
+    error = CallbackError("argument callback failed")
+
+    def fail(value):
+        raise error
+
+    engine = Engine(worker_count=1, queue_capacity=8)
+    try:
+        handle = engine.submit(fail, 1)
+
+        with pytest.raises(CallbackError, match="argument callback failed") as caught:
+            handle.wait()
+
+        assert caught.value is error
+        assert handle.exception() is error
+    finally:
+        engine.close()
+
+
+def test_submit_async_forwards_positional_keyword_and_mixed_arguments():
+    def describe(prefix, value, *, suffix=""):
+        return prefix + value + suffix
+
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            positional = engine.submit_async(pow, 2, 5)
+            assert isinstance(positional, asyncio.Future)
+            assert await positional == 32
+
+            keyword = engine.submit_async(pow, base=2, exp=5)
+            assert await keyword == 32
+
+            mixed = engine.submit_async(describe, "a", "b", suffix="c")
+            assert await mixed == "abc"
+
+            empty_kwargs: dict[str, object] = {}
+            no_kwargs = engine.submit_async(describe, "a", "b", **empty_kwargs)
+            assert await no_kwargs == "ab"
+        finally:
+            engine.close()
+
+    asyncio.run(main())
+
+
+def test_submit_async_argument_binding_errors_are_future_failures():
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            too_few = engine.submit_async(pow, 2)
+            with pytest.raises(TypeError):
+                await too_few
+
+            unexpected = engine.submit_async(pow, 2, 3, unexpected=True)
+            with pytest.raises(TypeError):
+                await unexpected
+        finally:
+            engine.close()
+
+    asyncio.run(main())
+
+
+def test_submit_async_with_arguments_preserves_callback_exception_identity():
+    class CallbackError(Exception):
+        pass
+
+    error = CallbackError("async argument callback failed")
+
+    def fail(value):
+        raise error
+
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            future = engine.submit_async(fail, 1)
+
+            with pytest.raises(
+                CallbackError, match="async argument callback failed"
+            ) as caught:
+                await future
+
+            assert caught.value is error
+        finally:
+            engine.close()
+
+    asyncio.run(main())
+
+
+def test_submit_async_argument_forwarding_keeps_coroutine_checks():
+    async def coroutine_function(value):
+        return value
+
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            with pytest.raises(TypeError, match="synchronous callable"):
+                engine.submit_async(coroutine_function, 1)
+
+            future = engine.submit_async(lambda value: coroutine_function(value), 1)
+            with pytest.raises(TypeError, match="returned an awaitable"):
+                await future
+        finally:
+            engine.close()
+
+    asyncio.run(main())
+
+
+def test_queue_full_rejection_releases_callable_and_arguments():
+    class TrackedCallable:
+        def __call__(self, argument):
+            return argument
+
+    class TrackedArgument:
+        pass
+
+    engine = Engine(worker_count=1, queue_capacity=1)
+
+    def blocker():
+        started.set()
+        assert release.wait(5)
+
+    started = threading.Event()
+    release = threading.Event()
+    try:
+        first = engine.submit(blocker)
+        assert started.wait(5)
+        second = engine.submit(lambda: None)
+
+        callable_object = TrackedCallable()
+        argument = TrackedArgument()
+        callable_ref = weakref.ref(callable_object)
+        argument_ref = weakref.ref(argument)
+
+        with pytest.raises(QueueFullError):
+            engine.submit(callable_object, argument)
+
+        del callable_object, argument
+        gc.collect()
+        assert callable_ref() is None
+        assert argument_ref() is None
+    finally:
+        release.set()
+        engine.close()
+
+    assert first.wait() is None
+    assert second.wait() is None
+
+
+def test_queued_cancellation_releases_callable_and_arguments():
+    class TrackedCallable:
+        def __call__(self, argument):
+            return argument
+
+    class TrackedArgument:
+        pass
+
+    def blocker_task():
+        started.set()
+        assert release.wait(5)
+
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+    try:
+        blocker = engine.submit(blocker_task)
+        assert started.wait(5)
+
+        callable_object = TrackedCallable()
+        argument = TrackedArgument()
+        callable_ref = weakref.ref(callable_object)
+        argument_ref = weakref.ref(argument)
+
+        handle = engine.submit(callable_object, argument)
+        assert handle.cancel()
+
+        marker = engine.submit(lambda: None)
+        release.set()
+
+        assert marker.wait() is None
+        assert blocker.wait() is None
+        del callable_object, argument
+        gc.collect()
+        assert callable_ref() is None
+        assert argument_ref() is None
+    finally:
+        release.set()
+        engine.close()
+
+
+def test_shutdown_drains_and_releases_arguments():
+    class TrackedCallable:
+        def __call__(self, argument):
+            return None
+
+    class TrackedArgument:
+        pass
+
+    def blocker_task():
+        started.set()
+        assert release.wait(5)
+
+    engine = Engine(worker_count=1, queue_capacity=8)
+    started = threading.Event()
+    release = threading.Event()
+    errors = []
+    try:
+        blocker = engine.submit(blocker_task)
+        assert started.wait(5)
+
+        callable_object = TrackedCallable()
+        argument = TrackedArgument()
+        callable_ref = weakref.ref(callable_object)
+        argument_ref = weakref.ref(argument)
+        handle = engine.submit(callable_object, argument)
+
+        def close():
+            try:
+                engine.close()
+            except BaseException as error:
+                errors.append(error)
+
+        closer = threading.Thread(target=close)
+        closer.start()
+        deadline = time.monotonic() + 5
+        while not engine.closed and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert engine.closed
+        release.set()
+        closer.join(5)
+
+        assert not closer.is_alive()
+        assert errors == []
+        assert blocker.wait() is None
+        assert handle.wait() is None
+        del callable_object, argument
+        gc.collect()
+        assert callable_ref() is None
+        assert argument_ref() is None
+    finally:
+        release.set()
+        engine.close()
+
+
+def test_submit_async_with_arguments_releases_references_after_completion():
+    class TrackedCallable:
+        def __call__(self, argument):
+            return argument.value
+
+    class TrackedArgument:
+        def __init__(self, value):
+            self.value = value
+
+    async def main():
+        engine = Engine(worker_count=1, queue_capacity=8)
+        try:
+            callable_object = TrackedCallable()
+            argument = TrackedArgument(42)
+            callable_ref = weakref.ref(callable_object)
+            argument_ref = weakref.ref(argument)
+
+            future = engine.submit_async(callable_object, argument)
+            assert await future == 42
+
+            del callable_object, argument
+            gc.collect()
+            assert callable_ref() is None
+            assert argument_ref() is None
+        finally:
+            engine.close()
+
+    asyncio.run(main())
 
 
 def test_packaged_typing_metadata_is_available():

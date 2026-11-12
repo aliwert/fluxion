@@ -1,10 +1,12 @@
 """Python interface for the Fluxion execution engine.
 
-Fluxion submits Python callables to a Rust-managed worker pool. Callbacks run
-on worker threads while attached to the Python interpreter and must acquire the
-GIL, so under standard CPython CPU-bound Python callbacks are serialized and do
-not execute in parallel. The Rust core can execute native workloads in
-parallel, but this binding currently exposes Python callbacks only.
+Fluxion submits Python callables to a Rust-managed worker pool. Positional and
+keyword arguments are forwarded to the callable using normal Python calling
+semantics. Callbacks run on worker threads while attached to the Python
+interpreter and must acquire the GIL, so under standard CPython CPU-bound Python
+callbacks are serialized and do not execute in parallel. The Rust core can
+execute native workloads in parallel, but this binding currently exposes Python
+callbacks only.
 
 Task handles expose lifecycle information and support cancellation before a
 task starts. ``wait`` and ``result`` block until a result is available,
@@ -26,8 +28,9 @@ reference is released inside a callback, the remaining workers drain accepted
 tasks and shut down safely.
 
 ``Engine.submit_async`` is available only while an asyncio event loop is running.
-It accepts a synchronous callable, runs it on a Fluxion worker, and returns an
-``asyncio.Future`` bound to that loop. Results are delivered on the loop through
+It accepts a synchronous callable plus optional positional and keyword
+arguments, runs it on a Fluxion worker, and returns an ``asyncio.Future`` bound
+to that loop. Results are delivered on the loop through
 ``call_soon_threadsafe``; worker threads never complete futures directly.
 Coroutine functions and callables that return awaitable objects are rejected
 with ``TypeError``; use ``asyncio.create_task`` for coroutine execution.
@@ -48,8 +51,11 @@ Example:
         assert handle.wait() == 42
         assert handle.status == "completed"
 
+        handle = engine.submit(pow, 2, 3)
+        assert handle.wait() == 8
+
         async def compute():
-            future = engine.submit_async(lambda: 21 * 2)
+            future = engine.submit_async(pow, 21, 2)
             return await future
 
         assert asyncio.run(compute()) == 42

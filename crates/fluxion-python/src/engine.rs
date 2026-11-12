@@ -7,7 +7,7 @@ use std::time::Duration;
 use fluxion_core::{Engine, EngineConfig, EngineError};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyBool, PyInt};
+use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyInt, PyTuple, PyTupleMethods};
 
 use crate::asyncio::{AsyncCompletion, AsyncTaskHandle, cancellation_callback, new_future};
 use crate::convert::engine_state;
@@ -215,15 +215,25 @@ impl PyEngine {
         self.is_forked() || self.state.load(Ordering::Acquire) != STATE_RUNNING
     }
 
-    /// Submits a zero-argument Python callable and returns a task handle.
+    /// Submits a Python callable and returns a task handle.
     ///
-    /// The callable executes on a Fluxion worker thread. It is called while
-    /// attached to the Python interpreter and holding the GIL. A non-callable
-    /// argument raises ``TypeError``; submitting after close or while the queue
-    /// is full raises :class:`fluxion.EngineClosedError` or
-    /// :class:`fluxion.QueueFullError`. Exceptions raised by the callback are
-    /// preserved and re-raised by :meth:`TaskHandle.wait`.
-    fn submit(&self, py: Python<'_>, callable: Py<PyAny>) -> PyResult<PyTaskHandle> {
+    /// Positional and keyword arguments are forwarded to the callable using
+    /// normal Python calling semantics. The callable executes on a Fluxion
+    /// worker thread. It is called while attached to the Python interpreter and
+    /// holding the GIL. A non-callable argument raises ``TypeError``; submitting
+    /// after close or while the queue is full raises
+    /// :class:`fluxion.EngineClosedError` or :class:`fluxion.QueueFullError`.
+    /// Argument-binding errors raised by Python during invocation are reported
+    /// through the resulting :class:`TaskHandle`. Exceptions raised by the
+    /// callback are preserved and re-raised by :meth:`TaskHandle.wait`.
+    #[pyo3(signature = (callable, *args, **kwargs))]
+    fn submit(
+        &self,
+        py: Python<'_>,
+        callable: Py<PyAny>,
+        args: Py<PyTuple>,
+        kwargs: Option<Py<PyDict>>,
+    ) -> PyResult<PyTaskHandle> {
         self.ensure_running(py)?;
 
         if !callable.bind(py).is_callable() {
@@ -240,8 +250,10 @@ impl PyEngine {
         let handle = engine
             .submit(move || -> PythonTaskResult {
                 let result = match Python::try_attach(move |py| {
-                    let result = callable.call0(py);
+                    let result = invoke_python(py, &callable, &args, kwargs.as_ref());
                     drop(callable);
+                    drop(args);
+                    drop(kwargs);
                     result
                 }) {
                     Some(result) => result,
@@ -261,24 +273,32 @@ impl PyEngine {
         Ok(PyTaskHandle::new(handle, callback_failure, self.owner_pid))
     }
 
-    /// Submits a synchronous zero-argument Python callable and returns an
-    /// asyncio Future.
+    /// Submits a synchronous Python callable and returns an asyncio Future.
     ///
-    /// The method must be called from a thread with a running asyncio event
-    /// loop. The returned Future is bound to that loop and must be awaited from
-    /// the same loop. It is completed through ``loop.call_soon_threadsafe``;
-    /// worker threads never complete or cancel the Future directly.
+    /// Positional and keyword arguments are forwarded to the callable using
+    /// normal Python calling semantics. The method must be called from a thread
+    /// with a running asyncio event loop. The returned Future is bound to that
+    /// loop and must be awaited from the same loop. It is completed through
+    /// ``loop.call_soon_threadsafe``; worker threads never complete or cancel
+    /// the Future directly.
     ///
     /// Coroutine functions and callables that return awaitable objects are
     /// rejected with ``TypeError``. Use ``asyncio.create_task`` for coroutine
-    /// execution. Cancelling the Future before execution starts cancels the
-    /// queued Rust task. Once the callback has started, cancellation does not
-    /// interrupt it; the Future is still cancelled normally and any later
-    /// result is discarded. Callback exceptions are preserved, while task
-    /// panics and worker disconnections raise
-    /// :class:`fluxion.TaskPanicError` or
+    /// execution. Argument-binding errors are delivered through the Future.
+    /// Cancelling the Future before execution starts cancels the queued Rust
+    /// task. Once the callback has started, cancellation does not interrupt it;
+    /// the Future is still cancelled normally and any later result is
+    /// discarded. Callback exceptions are preserved, while task panics and
+    /// worker disconnections raise :class:`fluxion.TaskPanicError` or
     /// :class:`fluxion.WorkerDisconnectedError`.
-    fn submit_async(&self, py: Python<'_>, callable: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (callable, *args, **kwargs))]
+    fn submit_async(
+        &self,
+        py: Python<'_>,
+        callable: Py<PyAny>,
+        args: Py<PyTuple>,
+        kwargs: Option<Py<PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
         self.ensure_running(py)?;
 
         if !callable.bind(py).is_callable() {
@@ -305,8 +325,10 @@ impl PyEngine {
             let completion_ref = &mut completion;
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                 match Python::try_attach(move |py| {
-                    let result = callable.call0(py);
+                    let result = invoke_python(py, &callable, &args, kwargs.as_ref());
                     drop(callable);
+                    drop(args);
+                    drop(kwargs);
 
                     let result = match result {
                         Ok(value) => match reject_awaitable_result(py, value.bind(py)) {
@@ -460,6 +482,25 @@ impl Drop for PyEngine {
             Python::try_attach(|py| py.detach(move || drop(engine)));
         }
     }
+}
+
+fn invoke_python(
+    py: Python<'_>,
+    callable: &Py<PyAny>,
+    args: &Py<PyTuple>,
+    kwargs: Option<&Py<PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let callable = callable.bind(py);
+    let args = args.bind(py);
+    let kwargs = kwargs.map(|kwargs| kwargs.bind(py));
+
+    let result = if args.is_empty() && kwargs.is_none() {
+        callable.call0()
+    } else {
+        callable.call(args, kwargs)
+    };
+
+    result.map(|value| value.unbind())
 }
 
 fn lifecycle_coroutine(
