@@ -8,9 +8,57 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyFunction};
 
 use crate::convert::{status_name, task_status};
-use crate::error::{forked_process_error, task_error, timeout_error};
+use crate::error::{forked_process_error, native_error, task_error, timeout_error};
+use crate::native::{NativeError, NativeOutput};
 
 pub(crate) type PythonTaskResult = Result<Py<PyAny>, PyErr>;
+pub(crate) type NativeTaskResult = Result<NativeOutput, NativeError>;
+
+/// Core handle stored by a Python task handle.
+///
+/// Python callback and native operation results have different Rust types, so
+/// each handle dispatches to the core handle for its task kind.
+enum HandleKind {
+    Python(SharedTaskHandle<PythonTaskResult>),
+    Native(SharedTaskHandle<NativeTaskResult>),
+}
+
+impl HandleKind {
+    fn status(&self) -> TaskStatus {
+        match self {
+            Self::Python(handle) => handle.status(),
+            Self::Native(handle) => handle.status(),
+        }
+    }
+
+    fn wait_until_ready(&self, timeout: Option<Duration>) -> bool {
+        match self {
+            Self::Python(handle) => handle.wait_until_ready(timeout),
+            Self::Native(handle) => handle.wait_until_ready(timeout),
+        }
+    }
+
+    fn cancel(&self) -> bool {
+        match self {
+            Self::Python(handle) => handle.cancel(),
+            Self::Native(handle) => handle.cancel(),
+        }
+    }
+
+    fn done(&self) -> bool {
+        match self {
+            Self::Python(handle) => handle.done(),
+            Self::Native(handle) => handle.done(),
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        match self {
+            Self::Python(handle) => handle.cancelled(),
+            Self::Native(handle) => handle.cancelled(),
+        }
+    }
+}
 
 /// Rejects coroutine functions and callables whose ``__call__`` is a coroutine
 /// function before a task is submitted to the engine.
@@ -79,18 +127,18 @@ fn coroutine_function_error() -> PyErr {
     )
 }
 
-/// Shared Python-level flag indicating that a callback raised.
+/// Shared Python-level flag indicating that a task failed.
 ///
-/// The Rust core sees a Python exception as a successfully returned
-/// `Result::Err`, so this flag preserves the Python-facing distinction between
-/// a completed callback and a failed callback without changing the core task
+/// The Rust core sees a Python exception or native error as a successfully
+/// returned `Result::Err`, so this flag preserves the Python-facing distinction
+/// between a completed task and a failed task without changing the core task
 /// lifecycle.
 #[derive(Clone)]
-pub(crate) struct CallbackFailure {
+pub(crate) struct TaskFailure {
     failed: Arc<Mutex<bool>>,
 }
 
-impl CallbackFailure {
+impl TaskFailure {
     pub(crate) fn new() -> Self {
         Self {
             failed: Arc::new(Mutex::new(false)),
@@ -117,34 +165,56 @@ fn lock_flag(flag: &Mutex<bool>) -> MutexGuard<'_, bool> {
 enum PyOutcome {
     Value(Py<PyAny>),
     CallbackError(PyErr),
+    NativeError(NativeError),
     CoreError(TaskError),
 }
 
 /// Handle to a task submitted to a Fluxion engine.
 ///
-/// A handle supports repeatable result access, including concurrent waits from
-/// multiple Python threads. Dropping a handle does not cancel the task; the
-/// task still runs and its result is discarded when the last handle is dropped.
+/// A handle supports repeatable result access for Python callbacks and trusted
+/// native operations, including concurrent waits from multiple Python threads.
+/// Dropping a handle does not cancel the task; the task still runs and its
+/// result is discarded when the last handle is dropped.
 ///
 /// Handles belong to the process that created their engine. Using a handle in
 /// a forked child raises :class:`fluxion.ForkedProcessError`.
 #[pyclass(name = "TaskHandle", module = "fluxion", generic)]
 pub(crate) struct PyTaskHandle {
-    handle: SharedTaskHandle<PythonTaskResult>,
-    callback_failure: CallbackFailure,
+    handle: HandleKind,
+    task_failure: TaskFailure,
     owner_pid: u32,
     mapped_failure: Mutex<Option<PyErr>>,
 }
 
 impl PyTaskHandle {
-    pub(crate) fn new(
+    pub(crate) fn new_python(
         handle: TaskHandle<PythonTaskResult>,
-        callback_failure: CallbackFailure,
+        task_failure: TaskFailure,
         owner_pid: u32,
     ) -> Self {
+        Self::new(
+            HandleKind::Python(handle.into_shared()),
+            task_failure,
+            owner_pid,
+        )
+    }
+
+    pub(crate) fn new_native(
+        handle: TaskHandle<NativeTaskResult>,
+        task_failure: TaskFailure,
+        owner_pid: u32,
+    ) -> Self {
+        Self::new(
+            HandleKind::Native(handle.into_shared()),
+            task_failure,
+            owner_pid,
+        )
+    }
+
+    fn new(handle: HandleKind, task_failure: TaskFailure, owner_pid: u32) -> Self {
         Self {
-            handle: handle.into_shared(),
-            callback_failure,
+            handle,
+            task_failure,
             owner_pid,
             mapped_failure: Mutex::new(None),
         }
@@ -172,7 +242,7 @@ impl PyTaskHandle {
     fn lifecycle_status(&self) -> TaskStatus {
         let core_status = self.handle.status();
 
-        if core_status == TaskStatus::Completed && self.callback_failure.load() {
+        if core_status == TaskStatus::Completed && self.task_failure.load() {
             TaskStatus::Failed
         } else {
             core_status
@@ -191,32 +261,57 @@ impl PyTaskHandle {
         match self.outcome(py)? {
             PyOutcome::Value(value) => Ok(value),
             PyOutcome::CallbackError(error) => Err(error),
+            PyOutcome::NativeError(error) => Err(self.mapped_native_failure(py, error)),
             PyOutcome::CoreError(error) => Err(self.mapped_failure(py, error)),
         }
     }
 
     fn outcome(&self, py: Python<'_>) -> PyResult<PyOutcome> {
-        let Some(view) = self.handle.result_view() else {
-            return Err(PyRuntimeError::new_err(
-                "task result is not published after the task was reported done",
-            ));
-        };
+        let outcome = match &self.handle {
+            HandleKind::Python(handle) => {
+                let Some(view) = handle.result_view() else {
+                    return Err(missing_result_error());
+                };
 
-        let outcome = match &*view {
-            Ok(Ok(value)) => PyOutcome::Value(value.clone_ref(py)),
-            Ok(Err(error)) => PyOutcome::CallbackError(error.clone_ref(py)),
-            Err(error) => PyOutcome::CoreError(error.clone()),
+                match &*view {
+                    Ok(Ok(value)) => PyOutcome::Value(value.clone_ref(py)),
+                    Ok(Err(error)) => PyOutcome::CallbackError(error.clone_ref(py)),
+                    Err(error) => PyOutcome::CoreError(error.clone()),
+                }
+            }
+            HandleKind::Native(handle) => {
+                let Some(view) = handle.result_view() else {
+                    return Err(missing_result_error());
+                };
+
+                match &*view {
+                    Ok(Ok(output)) => PyOutcome::Value(output.to_python(py)?),
+                    Ok(Err(error)) => PyOutcome::NativeError(*error),
+                    Err(error) => PyOutcome::CoreError(error.clone()),
+                }
+            }
         };
 
         Ok(outcome)
     }
 
     fn mapped_failure(&self, py: Python<'_>, error: TaskError) -> PyErr {
+        self.mapped_error(py, |py| task_error(py, error))
+    }
+
+    fn mapped_native_failure(&self, py: Python<'_>, error: NativeError) -> PyErr {
+        self.mapped_error(py, |py| native_error(py, error))
+    }
+
+    fn mapped_error<F>(&self, py: Python<'_>, map: F) -> PyErr
+    where
+        F: FnOnce(Python<'_>) -> PyErr,
+    {
         if let Some(error) = self.lock_mapped_failure().as_ref() {
             return error.clone_ref(py);
         }
 
-        let mapped = task_error(py, error);
+        let mapped = map(py);
         let mut cached = self.lock_mapped_failure();
 
         if let Some(error) = cached.as_ref() {
@@ -230,7 +325,7 @@ impl PyTaskHandle {
 
 #[pymethods]
 impl PyTaskHandle {
-    /// Blocks until the task completes and returns its Python result.
+    /// Blocks until the task completes and returns its result.
     ///
     /// This is a repeatable alias of :meth:`result`.
     #[pyo3(signature = (timeout=None))]
@@ -238,7 +333,7 @@ impl PyTaskHandle {
         self.wait_result(py, timeout)
     }
 
-    /// Blocks until the task completes and returns its Python result.
+    /// Blocks until the task completes and returns its result.
     ///
     /// With ``timeout=None`` the wait is indefinite. A finite timeout raises
     /// :class:`fluxion.TaskTimeoutError`, which is also catchable as
@@ -247,10 +342,10 @@ impl PyTaskHandle {
     /// use immediate-timeout semantics; NaN and infinite values raise
     /// ``ValueError``.
     ///
-    /// The GIL is released while waiting so Python callbacks on Fluxion worker
-    /// threads can make progress. If the callback raised an exception, that
-    /// same exception is re-raised here. A task panic or disconnected worker
-    /// raises :class:`fluxion.TaskPanicError` or
+    /// The GIL is released while waiting. If a Python callback raised an
+    /// exception, that same exception is re-raised here. A native operation
+    /// failure raises :class:`fluxion.NativeExecutionError`. A task panic or
+    /// disconnected worker raises :class:`fluxion.TaskPanicError` or
     /// :class:`fluxion.WorkerDisconnectedError`, both also catchable as
     /// ``RuntimeError``. A cancelled task raises
     /// :class:`fluxion.TaskCancelledError`, also catchable as
@@ -281,6 +376,10 @@ impl PyTaskHandle {
         let exception = match self.outcome(py)? {
             PyOutcome::Value(_) => return Ok(py.None()),
             PyOutcome::CallbackError(error) => error.into_value(py).into_any(),
+            PyOutcome::NativeError(error) => self
+                .mapped_native_failure(py, error)
+                .into_value(py)
+                .into_any(),
             PyOutcome::CoreError(error) => self.mapped_failure(py, error).into_value(py).into_any(),
         };
 
@@ -338,6 +437,10 @@ impl PyTaskHandle {
             )
         }
     }
+}
+
+fn missing_result_error() -> PyErr {
+    PyRuntimeError::new_err("task result is not published after the task was reported done")
 }
 
 fn parse_timeout(timeout: Option<f64>) -> PyResult<Option<Duration>> {

@@ -12,8 +12,10 @@ use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyInt, PyTuple, PyTupleMethods};
 use crate::asyncio::{AsyncCompletion, AsyncTaskHandle, cancellation_callback, new_future};
 use crate::convert::engine_state;
 use crate::error::{engine_error, forked_process_error};
+use crate::native::PyNativeOperation;
 use crate::task::{
-    CallbackFailure, PyTaskHandle, PythonTaskResult, ensure_sync_callable, reject_awaitable_result,
+    NativeTaskResult, PyTaskHandle, PythonTaskResult, TaskFailure, ensure_sync_callable,
+    reject_awaitable_result,
 };
 
 const STATE_RUNNING: u8 = 0;
@@ -24,8 +26,9 @@ const STATE_CLOSED: u8 = 2;
 ///
 /// Python callbacks require interpreter access and run while holding the GIL.
 /// Under standard CPython, CPU-bound Python callbacks are therefore serialized
-/// and do not execute in parallel. Fluxion's Rust core can execute native work
-/// in parallel, but this binding exposes Python callbacks only.
+/// and do not execute in parallel. Trusted native operations submitted through
+/// :meth:`submit_native` execute on the same workers without holding the GIL,
+/// allowing independent native tasks to run in parallel.
 ///
 /// Engines contain native worker threads and are not fork-safe. Create a new
 /// engine in the child process after ``fork()``.
@@ -245,8 +248,8 @@ impl PyEngine {
             .as_ref()
             .ok_or_else(|| engine_error(py, EngineError::AlreadyShutdown))?;
 
-        let callback_failure = CallbackFailure::new();
-        let task_failure = callback_failure.clone();
+        let task_failure_flag = TaskFailure::new();
+        let task_failure = task_failure_flag.clone();
         let handle = engine
             .submit(move || -> PythonTaskResult {
                 let result = match Python::try_attach(move |py| {
@@ -270,7 +273,60 @@ impl PyEngine {
             })
             .map_err(|error| engine_error(py, error))?;
 
-        Ok(PyTaskHandle::new(handle, callback_failure, self.owner_pid))
+        Ok(PyTaskHandle::new_python(
+            handle,
+            task_failure_flag,
+            self.owner_pid,
+        ))
+    }
+
+    /// Submits a trusted native operation and returns a task handle.
+    ///
+    /// ``operation`` must be one of the opaque operations exported by
+    /// :mod:`fluxion.native`. ``values`` is validated and copied into
+    /// Rust-owned memory before the task is queued; no Python references are
+    /// retained by the worker. The operation executes on a Fluxion worker
+    /// without holding the GIL, so independent native tasks can run in
+    /// parallel.
+    ///
+    /// Invalid input raises synchronously. Native execution failures are
+    /// reported through the returned :class:`TaskHandle`.
+    #[pyo3(signature = (operation, values))]
+    fn submit_native(
+        &self,
+        py: Python<'_>,
+        operation: PyRef<'_, PyNativeOperation>,
+        values: &Bound<'_, PyAny>,
+    ) -> PyResult<PyTaskHandle> {
+        self.ensure_running(py)?;
+
+        let kind = operation.kind();
+        let input = kind.prepare(values)?;
+
+        let inner = self.lock_inner();
+        let engine = inner
+            .as_ref()
+            .ok_or_else(|| engine_error(py, EngineError::AlreadyShutdown))?;
+
+        let task_failure_flag = TaskFailure::new();
+        let task_failure = task_failure_flag.clone();
+        let handle = engine
+            .submit(move || -> NativeTaskResult {
+                let result = kind.execute(input);
+
+                if result.is_err() {
+                    task_failure.mark();
+                }
+
+                result
+            })
+            .map_err(|error| engine_error(py, error))?;
+
+        Ok(PyTaskHandle::new_native(
+            handle,
+            task_failure_flag,
+            self.owner_pid,
+        ))
     }
 
     /// Submits a synchronous Python callable and returns an asyncio Future.

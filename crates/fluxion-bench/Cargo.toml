@@ -23,6 +23,10 @@ name = "scheduling_eval"
 harness = false
 
 [[bench]]
+name = "native_eval"
+harness = false
+
+[[bench]]
 name = "work_stealing_eval"
 harness = false
 required-features = ["experimental-work-stealing"]

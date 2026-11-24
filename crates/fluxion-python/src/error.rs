@@ -3,6 +3,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyType};
 
+use crate::native::NativeError;
+
 pub(crate) fn engine_error(py: Python<'_>, error: EngineError) -> PyErr {
     let message = error.to_string();
 
@@ -24,6 +26,10 @@ pub(crate) fn task_error(py: Python<'_>, error: TaskError) -> PyErr {
         TaskError::Panicked => fluxion_exception(py, "TaskPanicError", &message),
         TaskError::WorkerDisconnected => fluxion_exception(py, "WorkerDisconnectedError", &message),
     }
+}
+
+pub(crate) fn native_error(py: Python<'_>, error: NativeError) -> PyErr {
+    fluxion_exception(py, "NativeExecutionError", &error.to_string())
 }
 
 pub(crate) fn timeout_error(py: Python<'_>) -> PyErr {
