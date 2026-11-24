@@ -1,22 +1,44 @@
-from __future__ import annotations
-
 import asyncio
+from collections.abc import Callable, Coroutine, Iterable
 from types import TracebackType
-from typing import Any, Callable, Coroutine, Generic, ParamSpec, TypeVar, final
+from typing import Any, Generic, ParamSpec, TypeVar, final
 
+from ._core import NativeOperation
 from .errors import (
     EngineClosedError as EngineClosedError,
+)
+from .errors import (
     EngineError as EngineError,
+)
+from .errors import (
     FluxionError as FluxionError,
+)
+from .errors import (
     ForkedProcessError as ForkedProcessError,
+)
+from .errors import (
+    NativeExecutionError as NativeExecutionError,
+)
+from .errors import (
     QueueFullError as QueueFullError,
+)
+from .errors import (
     TaskCancelledError as TaskCancelledError,
+)
+from .errors import (
     TaskError as TaskError,
+)
+from .errors import (
     TaskPanicError as TaskPanicError,
+)
+from .errors import (
     TaskTimeoutError as TaskTimeoutError,
+)
+from .errors import (
     WorkerDisconnectedError as WorkerDisconnectedError,
 )
-from .status import EngineState as EngineState, TaskStatus as TaskStatus
+from .status import EngineState as EngineState
+from .status import TaskStatus as TaskStatus
 
 __version__: str
 
@@ -44,6 +66,11 @@ class Engine:
         *args: _P.args,
         **kwargs: _P.kwargs,
     ) -> TaskHandle[_T]: ...
+    def submit_native(
+        self,
+        operation: NativeOperation,
+        values: Iterable[int],
+    ) -> TaskHandle[int]: ...
     def submit_async(
         self,
         callable: Callable[_P, _T],
@@ -68,10 +95,11 @@ class Engine:
         exception_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> Coroutine[Any, Any, bool]: ...
-    def __repr__(self) -> str: ...
 
 @final
 class TaskHandle(Generic[_T]):
+    @classmethod
+    def __class_getitem__(cls, key: Any) -> Any: ...
     @property
     def status(self) -> TaskStatus: ...
     def done(self) -> bool: ...
@@ -81,6 +109,22 @@ class TaskHandle(Generic[_T]):
     def result(self, timeout: float | None = None) -> _T: ...
     def exception(self, timeout: float | None = None) -> BaseException | None: ...
     def wait(self, timeout: float | None = None) -> _T: ...
-    def __repr__(self) -> str: ...
 
-__all__: list[str]
+__all__ = [
+    "Engine",
+    "EngineClosedError",
+    "EngineError",
+    "EngineState",
+    "FluxionError",
+    "ForkedProcessError",
+    "NativeExecutionError",
+    "QueueFullError",
+    "TaskCancelledError",
+    "TaskError",
+    "TaskHandle",
+    "TaskPanicError",
+    "TaskStatus",
+    "TaskTimeoutError",
+    "WorkerDisconnectedError",
+    "__version__",
+]

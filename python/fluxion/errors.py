@@ -69,15 +69,25 @@ class WorkerDisconnectedError(TaskError, RuntimeError):
     """A worker exited before the task produced a result."""
 
 
+class NativeExecutionError(TaskError, RuntimeError):
+    """A trusted native operation failed while executing.
+
+    Invalid Python input is rejected synchronously with ``TypeError``,
+    ``ValueError``, or ``OverflowError``. This exception represents failures
+    detected by the native operation itself, such as integer overflow.
+    """
+
+
 __all__ = [
-    "FluxionError",
-    "EngineError",
     "EngineClosedError",
-    "QueueFullError",
+    "EngineError",
+    "FluxionError",
     "ForkedProcessError",
-    "TaskError",
+    "NativeExecutionError",
+    "QueueFullError",
     "TaskCancelledError",
-    "TaskTimeoutError",
+    "TaskError",
     "TaskPanicError",
+    "TaskTimeoutError",
     "WorkerDisconnectedError",
 ]

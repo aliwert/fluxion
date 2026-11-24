@@ -4,9 +4,10 @@ Fluxion submits Python callables to a Rust-managed worker pool. Positional and
 keyword arguments are forwarded to the callable using normal Python calling
 semantics. Callbacks run on worker threads while attached to the Python
 interpreter and must acquire the GIL, so under standard CPython CPU-bound Python
-callbacks are serialized and do not execute in parallel. The Rust core can
-execute native workloads in parallel, but this binding currently exposes Python
-callbacks only.
+callbacks are serialized and do not execute in parallel. Trusted native
+operations from :mod:`fluxion.native` can be submitted with
+``Engine.submit_native`` and execute without holding the GIL, allowing
+independent native tasks to run in parallel.
 
 Task handles expose lifecycle information and support cancellation before a
 task starts. ``wait`` and ``result`` block until a result is available,
@@ -84,6 +85,7 @@ from .errors import (
     EngineError,
     FluxionError,
     ForkedProcessError,
+    NativeExecutionError,
     QueueFullError,
     TaskCancelledError,
     TaskError,
@@ -95,18 +97,19 @@ from .status import EngineState, TaskStatus
 
 __all__ = [
     "Engine",
-    "TaskHandle",
-    "TaskStatus",
+    "EngineClosedError",
+    "EngineError",
     "EngineState",
     "FluxionError",
-    "EngineError",
-    "EngineClosedError",
-    "QueueFullError",
     "ForkedProcessError",
-    "TaskError",
+    "NativeExecutionError",
+    "QueueFullError",
     "TaskCancelledError",
-    "TaskTimeoutError",
+    "TaskError",
+    "TaskHandle",
     "TaskPanicError",
+    "TaskStatus",
+    "TaskTimeoutError",
     "WorkerDisconnectedError",
     "__version__",
 ]
