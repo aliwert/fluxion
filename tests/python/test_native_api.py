@@ -1,5 +1,7 @@
+import array
 import gc
 import os
+import struct
 import subprocess
 import sys
 import textwrap
@@ -85,6 +87,126 @@ def test_sum_squares_accepts_integer_iterables():
         engine.close()
 
 
+def test_sum_squares_accepts_buffer_compatible_integer_iterables():
+    engine = Engine(worker_count=2, queue_capacity=16)
+    cases = [
+        (array.array("q", []), 0),
+        (array.array("q", [1, -2, 3]), 14),
+        (memoryview(array.array("q", [])), 0),
+        (memoryview(array.array("q", [4, 5])), 41),
+        (memoryview(array.array("q", [6, 7])).toreadonly(), 85),
+        (memoryview(array.array("q", [0, 1, 2, 3]))[1:], 14),
+        (array.array("i", [1, 2, 3]), 14),
+        (array.array("Q", [1, 2, 3]), 14),
+    ]
+    if array.array("l").itemsize == 8:
+        cases.append((array.array("l", [2, 3]), 13))
+
+    try:
+        for values, expected in cases:
+            result = engine.submit_native(sum_squares, values).result(5)
+            assert type(result) is int
+            assert result == expected
+    finally:
+        engine.close()
+
+
+def test_native_buffer_input_is_copied_and_released_before_execution():
+    engine = Engine(worker_count=1, queue_capacity=4)
+    values = array.array("q", [1, 2, 3])
+    try:
+        handle = engine.submit_native(sum_squares, values)
+        values[0] = 100
+        values.append(4)
+        assert list(values) == [100, 2, 3, 4]
+        assert handle.result(5) == 14
+    finally:
+        engine.close()
+
+
+def test_native_noncontiguous_and_misaligned_buffers_fall_back_to_iteration():
+    engine = Engine(worker_count=1, queue_capacity=8)
+    noncontiguous = memoryview(array.array("q", [1, 2, 3, 4]))[::2]
+    raw = bytearray(b"\x00" + struct.pack("=3q", 1, 2, 3))
+    misaligned = memoryview(raw)[1:].cast("q")
+
+    try:
+        assert engine.submit_native(sum_squares, noncontiguous).result(5) == 10
+        assert engine.submit_native(sum_squares, misaligned).result(5) == 14
+    finally:
+        engine.close()
+
+
+def test_native_two_dimensional_buffer_falls_back_to_iteration():
+    engine = Engine(worker_count=1, queue_capacity=4)
+    raw = bytearray(struct.pack("=4q", 1, 2, 3, 4))
+    values = memoryview(raw).cast("q", shape=(2, 2))
+    try:
+        with pytest.raises(TypeError, match="must be an iterable of integers"):
+            engine.submit_native(sum_squares, values)
+    finally:
+        engine.close()
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="custom buffer protocol requires Python 3.12 or newer",
+)
+def test_native_custom_buffer_does_not_override_iteration():
+    class DualProtocol:
+        def __iter__(self):
+            return iter([1, 2, 3])
+
+        def __buffer__(self, flags):
+            return memoryview(array.array("q", [4, 5, 6]))
+
+    class SpoofedDualProtocol:
+        __module__ = "array"
+
+        def __iter__(self):
+            return iter([1, 2, 3])
+
+        def __buffer__(self, flags):
+            return memoryview(array.array("q", [4, 5, 6]))
+
+    SpoofedDualProtocol.__name__ = "array"
+
+    engine = Engine(worker_count=1, queue_capacity=4)
+    try:
+        for values in (DualProtocol(), SpoofedDualProtocol()):
+            assert memoryview(values).format == "q"
+            assert engine.submit_native(sum_squares, values).result(5) == 14
+    finally:
+        engine.close()
+
+
+def test_native_numpy_int64_buffer_when_available():
+    numpy = pytest.importorskip("numpy")
+    engine = Engine(worker_count=1, queue_capacity=4)
+    try:
+        values = numpy.array([1, 2, 3], dtype=numpy.int64)
+        assert engine.submit_native(sum_squares, values).result(5) == 14
+    finally:
+        engine.close()
+
+
+def test_native_numpy_big_endian_buffer_when_available():
+    numpy = pytest.importorskip("numpy")
+    engine = Engine(worker_count=1, queue_capacity=4)
+    try:
+        values = numpy.array([1, 2, 3], dtype=">i8")
+        if sys.byteorder == "big":
+            assert engine.submit_native(sum_squares, values).result(5) == 14
+            assert engine.submit_native(sum_squares, memoryview(values)).result(5) == 14
+        else:
+            with pytest.raises(TypeError):
+                engine.submit_native(sum_squares, values)
+            with pytest.raises(TypeError):
+                engine.submit_native(sum_squares, memoryview(values))
+    finally:
+        engine.close()
+
+
 @pytest.mark.parametrize(
     ("values", "exception"),
     [
@@ -97,6 +219,8 @@ def test_sum_squares_accepts_integer_iterables():
         ([1, "2"], TypeError),
         ([1, 2.0], TypeError),
         ([True], TypeError),
+        (array.array("d", [1.0]), TypeError),
+        (array.array("Q", [2**63]), OverflowError),
         ([2**63], OverflowError),
         ([-(2**63) - 1], OverflowError),
     ],

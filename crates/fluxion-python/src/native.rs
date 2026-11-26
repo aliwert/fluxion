@@ -11,9 +11,14 @@
 
 use std::fmt;
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyOverflowError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyBool, PyByteArray, PyBytes, PyInt, PyString};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{
+    PyAnyMethods, PyBool, PyByteArray, PyBytes, PyInt, PyMemoryView, PyString, PyType,
+    PyTypeMethods,
+};
 
 #[cfg(debug_assertions)]
 use crate::testing::{NativeProbe, PyNativeProbe};
@@ -212,6 +217,98 @@ pub(crate) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult
 
 const MAX_INITIAL_CAPACITY: usize = 4096;
 
+static ARRAY_ARRAY_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static NUMPY_NDARRAY_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+fn is_array_array(values: &Bound<'_, PyAny>) -> bool {
+    let ty = values.get_type_ptr().cast::<pyo3::ffi::PyObject>();
+    let py = values.py();
+    if let Some(expected) = ARRAY_ARRAY_TYPE.get(py) {
+        return ty == expected.as_ptr();
+    }
+
+    ARRAY_ARRAY_TYPE
+        .import(py, "array", "array")
+        .is_ok_and(|expected| ty == expected.as_ptr())
+}
+
+fn is_numpy_ndarray(values: &Bound<'_, PyAny>) -> bool {
+    let ty = values.get_type_ptr().cast::<pyo3::ffi::PyObject>();
+    let py = values.py();
+    if let Some(expected) = NUMPY_NDARRAY_TYPE.get(py) {
+        return ty == expected.as_ptr();
+    }
+
+    let type_object = values.get_type();
+    let Ok(module) = type_object.module() else {
+        return false;
+    };
+    let Ok(name) = type_object.name() else {
+        return false;
+    };
+    if !(module.eq("numpy") && name.eq("ndarray")) {
+        return false;
+    }
+
+    NUMPY_NDARRAY_TYPE
+        .import(py, "numpy", "ndarray")
+        .is_ok_and(|expected| ty == expected.as_ptr())
+}
+
+fn is_known_buffer_container(values: &Bound<'_, PyAny>) -> bool {
+    values.is_instance_of::<PyMemoryView>() || is_array_array(values) || is_numpy_ndarray(values)
+}
+
+fn is_native_signed_i64_format(format: &std::ffi::CStr) -> bool {
+    let bytes = format.to_bytes();
+    let (prefix, type_char) = match bytes {
+        [type_char] => (None, *type_char),
+        [prefix, type_char] => (Some(*prefix), *type_char),
+        _ => return false,
+    };
+    let native_endian = match prefix {
+        None | Some(b'@' | b'=') => true,
+        Some(b'<') => cfg!(target_endian = "little"),
+        Some(b'>' | b'!') => cfg!(target_endian = "big"),
+        Some(_) => false,
+    };
+
+    native_endian && matches!(type_char, b'l' | b'q' | b'n')
+}
+
+fn try_extract_i64_buffer(values: &Bound<'_, PyAny>) -> PyResult<Option<Vec<i64>>> {
+    if unsafe { pyo3::ffi::PyObject_CheckBuffer(values.as_ptr()) } == 0 {
+        return Ok(None);
+    }
+
+    if !is_known_buffer_container(values) {
+        return Ok(None);
+    }
+
+    let buffer = match PyBuffer::<i64>::get(values) {
+        Ok(buffer) => buffer,
+        Err(_) => return Ok(None),
+    };
+
+    if buffer.dimensions() != 1
+        || !buffer.is_c_contiguous()
+        || buffer.item_size() != 8
+        || !is_native_signed_i64_format(buffer.format())
+    {
+        return Ok(None);
+    }
+
+    let item_count = buffer.item_count();
+    if buffer.len_bytes() != item_count.saturating_mul(8)
+        || (buffer.len_bytes() != 0 && buffer.buf_ptr().is_null())
+        || buffer.shape().first().copied() != Some(item_count)
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(buffer.to_vec(values.py())?))
+}
+
 fn extract_i64_values(values: &Bound<'_, PyAny>) -> PyResult<Vec<i64>> {
     if values.is_instance_of::<PyString>()
         || values.is_instance_of::<PyBytes>()
@@ -220,6 +317,10 @@ fn extract_i64_values(values: &Bound<'_, PyAny>) -> PyResult<Vec<i64>> {
         return Err(PyTypeError::new_err(
             "sum_squares() values must be an iterable of integers, not a string or byte sequence",
         ));
+    }
+
+    if let Some(converted) = try_extract_i64_buffer(values)? {
+        return Ok(converted);
     }
 
     let iterator = values.try_iter().map_err(|_| {
