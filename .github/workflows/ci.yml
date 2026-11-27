@@ -50,6 +50,8 @@ jobs:
         env:
           VIRTUAL_ENV: ${{ github.workspace }}/.venv
       - run: .venv/bin/python -m pytest tests/python -q -p no:cacheprovider
+      - name: Wheel validator regression tests
+        run: .venv/bin/python -m pytest tests/test_check_wheel.py -q -p no:cacheprovider
       - name: Asyncio debug checks
         env:
           PYTHONASYNCIODEBUG: "1"
